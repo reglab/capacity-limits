@@ -1,0 +1,1744 @@
+---
+title: "Capacity Paper: Revisions"
+author: "RegLab"
+date: "8/26/2021"
+output: html_document
+---
+## Load Libraries
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(knitr)
+library(collections)
+library(broom)
+library(plotly)
+library(lubridate)
+library(clubSandwich)
+library(reshape2)
+library(scales)
+library(jsonlite)
+library(ggsci)
+library(directlabels)
+library(ggrepel)
+library(extrafont)
+library(ggpubr)
+library(patchwork)
+library(clusterSEs)
+```
+
+
+## Load data
+
+```{r load county data}
+#set wd
+setwd("") # Change working directory to folder containing preprocessed daily patterns.
+
+#load each file individually
+alameda_data <- readRDS("Alameda-daily-patterns-backfill.rds")
+contra_costa_data <- readRDS("Contra Costa-daily-patterns-backfill.rds")
+marin_data <- readRDS("Marin-daily-patterns-backfill.rds")
+napa_data <- readRDS("Napa-daily-patterns-backfill.rds")
+san_francisco_data <- readRDS("San Francisco-daily-patterns-backfill.rds")
+san_mateo_data <- readRDS("San Mateo-daily-patterns-backfill.rds")
+santa_clara_data <- readRDS("Santa Clara-daily-patterns-backfill.rds")
+solano_data <- readRDS("Solano-daily-patterns-backfill.rds")
+sonoma_data <- readRDS("Sonoma-daily-patterns-backfill.rds")
+ 
+# #Combine all relevant county data into one dataframe
+ all_county_data <- filter(alameda_data, sector %in% c("big_box","grocery","pharmacy")) %>%
+   rbind(filter(contra_costa_data, sector %in% c("big_box","grocery","pharmacy"))) %>%
+   rbind(filter(marin_data, sector %in% c("big_box","grocery","pharmacy"))) %>%
+   rbind(filter(napa_data, sector %in% c("big_box","grocery","pharmacy"))) %>%
+   rbind(filter(san_francisco_data, sector %in% c("big_box","grocery","pharmacy"))) %>%
+   rbind(filter(san_mateo_data, sector %in% c("big_box","grocery","pharmacy"))) %>%
+   rbind(filter(santa_clara_data, sector %in% c("big_box","grocery","pharmacy"))) %>%
+   rbind(filter(solano_data, sector %in% c("big_box","grocery","pharmacy"))) %>%
+   rbind(filter(sonoma_data, sector %in% c("big_box","grocery","pharmacy"))) 
+
+# #Remove individual files to save space
+# remove(alameda_data, contra_costa_data, marin_data, napa_data, san_francisco_data, san_mateo_data, solano_data, sonoma_data)
+```
+
+```{r load square footage data}
+#load each file individually
+setwd("") # Change working directory to directory containing square footage.
+square_footage_all <- readRDS("may-june-august-sqft.rds")
+
+list <- santa_clara_data %>% 
+  filter(sector!="restaurant") %>%
+  group_by(safegraph_place_id,sector) %>% 
+  summarise(dates=n_distinct(date))
+
+size_mapping <- list %>%
+  left_join(square_footage_all, by="safegraph_place_id") %>%
+  select(sector, safegraph_place_id, area_square_feet) %>%
+  group_by(sector) %>%
+  mutate(half=ntile(area_square_feet,2),
+         top_half=ifelse(half==2,"Top Half", "Bottom Half")) %>%
+  select(safegraph_place_id, top_half)
+```
+
+## DiD Trends
+
+```{r DiD Trend - Aggregate All County Data}
+
+#Load in relevant dates 
+relevant_dates_2020 <- all_county_data %>%
+  filter(date > '2020-10-01') %>% 
+  mutate(year_cohort='this year')
+
+relevant_dates_2019 <- all_county_data %>%
+  filter(date > '2019-10-01' & date < '2020-03-01') %>% 
+  mutate(year_cohort='last year')
+
+#Combine for all relevant dates
+relevant_dates <- relevant_dates_2020 %>%
+  rbind(relevant_dates_2019)
+
+#Remove intermediate tables to save space
+remove(relevant_dates_2019, relevant_dates_2020)
+
+#Aggregate to weekly
+figure_weekly <-
+  relevant_dates %>%
+  mutate(week = date %>% strftime("%V"),
+         year = date %>% strftime("%g"),
+         combo=paste0(week,year)) %>%
+  group_by(sector,
+           week,
+           year,
+           combo,
+           county,
+           year_cohort) %>%
+  summarise(weekly_visits=sum(daily_visits),
+            median_dwell=mean(median_dwell),
+            num_stores=n_distinct(safegraph_place_id),
+            avg_weekly_visits=weekly_visits/num_stores,
+            avg_peak_hourly_visits=mean(peak_hourly_visits)) %>%
+  mutate(adoption_cohort=ifelse(county %in% c("San Mateo", "Solano", "Sonoma", "Napa"), 
+                                "Late",
+                                "Early")
+         )
+
+figure_weekly_size <-
+  relevant_dates %>%
+  left_join(size_mapping,by="safegraph_place_id")%>%
+  mutate(week = date %>% strftime("%V"),
+         year = date %>% strftime("%g"),
+         combo=paste0(week,year)) %>%
+  group_by(sector.x,
+           week,
+           year,
+           top_half,
+           combo,
+           county,
+           year_cohort) %>%
+  summarise(weekly_visits=sum(daily_visits),
+            median_dwell=mean(median_dwell),
+            num_stores=n_distinct(safegraph_place_id),
+            avg_weekly_visits=weekly_visits/num_stores,
+            avg_peak_hourly_visits=mean(peak_hourly_visits)) %>%
+  mutate(adoption_cohort=ifelse(county %in% c("San Mateo", "Solano", "Sonoma", "Napa"), 
+                                "Late",
+                                "Early"),
+         sector=sector.x
+         )
+```
+
+```{r Loop Through and Normalize}
+#Create lists to loop over
+sectors <- unique(filter(relevant_dates, county!="Santa Clara")$sector)
+counties <- unique(relevant_dates$county)
+years <- unique(relevant_dates$year_cohort)
+
+#Create a holding table for normalized figures with 3 dummy new column values
+normalized <-figure_weekly %>%
+  top_n(1) %>%
+  mutate(norm_weekly_visits = 100,
+         norm_dwell=100,
+         norm_peak_visits=100)
+
+#Loop through and normalize
+for (sect in sectors){
+  for (c in counties){
+    for(y in years){
+    temp <- filter(figure_weekly, county==c & sector==sect & year_cohort==y) 
+    max_visits<-max(temp$avg_weekly_visits)
+    max_dwell<-max(temp$median_dwell)
+    max_peak <- max(temp$avg_peak_hourly_visits)
+    
+    temp <- temp %>%
+      mutate(
+         norm_weekly_visits = avg_weekly_visits/max_visits,
+         norm_dwell=median_dwell/max_dwell,
+         norm_peak_visits = avg_peak_hourly_visits/max_peak
+         )
+    
+    normalized <- normalized %>% rbind(temp)
+    }
+  }
+}
+
+#Remove dummy row
+normalized <- normalized %>% filter(norm_weekly_visits!=100)
+
+```
+
+
+###Run previuos two chunks - Figure 2, Figure 12 in A.8, and Figure 16 A.11
+```{r Create Figures - All, SCC vs SMC, SCC YoY}
+#Clean up text for labels, re-order week numbers (week_mod)
+normalized <- normalized %>%
+  mutate(week_num = as.numeric(week),
+         week_mod = ifelse((week_num < 40 & year_cohort=='last year'), week_num+52, week_num),
+         week_mod = ifelse((week_num < 40 & year_cohort=='this year'), week_num+53, week_mod),
+         sector = ifelse(sector=="big_box", "General Merchandise Stores", sector),
+         sector = ifelse(sector=="pharmacy", "Pharmacies", sector),
+         sector = ifelse(sector=="grocery", "Groceries", sector),
+         year_cohort = ifelse(year_cohort=='last year',"2019-2020", "2020-2021"),
+         Adoption=ifelse(adoption_cohort=="Early","Adopted 20% Early", "Adopted 20% Late")) %>%
+  mutate(sector=factor(sector, 
+                       levels=c("Groceries","Pharmacies","General Merchandise Stores")),
+         year_cohort=factor(year_cohort,
+                            levels=c("2019-2020","2020-2021"))
+          )
+
+figure_weekly_size <- figure_weekly_size %>%
+  mutate(week_num = as.numeric(week),
+         week_mod = ifelse(week_num < 40, week_num+53, week_num),
+         sector = ifelse(sector=="big_box", "General Merchandise Stores", sector),
+         sector = ifelse(sector=="pharmacy", "Pharmacies", sector),
+         sector = ifelse(sector=="grocery", "Groceries", sector),
+         year_cohort = ifelse(year_cohort=='last year',"2019-2020", "2020-2021"),
+         Adoption=ifelse(adoption_cohort=="Early","Adopted 20% Early", "Adopted 20% Late")) %>%
+  mutate(sector=factor(sector, 
+                       levels=c("Groceries","Pharmacies","General Merchandise Stores")),
+         year_cohort=factor(year_cohort,
+                            levels=c("2019-2020","2020-2021")),
+         top_half=factor(top_half,levels=c("Top Half", "Bottom Half"))
+          )
+
+#Create month labels for given period of time
+month_labels <- c("Oct", "Nov", "Dec", "Jan", "Feb")
+
+#Create plot for two years, all counties
+norm_all <- ggplot() +
+        geom_line(filter(normalized,week_mod>40),
+                  mapping=aes(x=week_mod,
+                              y=norm_weekly_visits,
+                              group=county,
+                              color=Adoption)) +
+      facet_grid(~year_cohort~sector) +
+      labs(y="Weekly average visits (normalized)") +
+      theme_classic() +
+      theme(axis.title.x = element_blank(),
+            legend.position = "bottom",
+            strip.background = element_blank()) +
+      scale_x_continuous(breaks=c(40.25,44.9,49.1,53.5,58),
+                         labels=month_labels) + 
+      scale_color_manual(values = c("Adopted 20% Early" = "#E10077", 
+                                    "Adopted 20% Late" = "#559B06"))+
+      ylim(0,1)+
+      geom_vline(xintercept = 49.5, linetype="dotted", 
+                color = "#212121", size=1) +
+      annotate("text",
+               x=48,
+               y=0.2,
+               angle=90,
+               color="#212121",
+               label="20% Order (12/6)",
+               size=3,
+               family="Helvetica")
+
+ggsave("all_bay_trend.png",width=10,height=6)
+
+#Create SCC vs SMC Comparison
+scc_smc <- filter(normalized, county=="Santa Clara" | county=="San Mateo") %>%
+  filter(week_mod > 40 & year_cohort=="2020-2021")
+
+# A data frame with labels for each facet
+scc_v_smc <- ggplot(scc_smc, 
+                  mapping=aes(x=week_mod,
+                              y=norm_weekly_visits,
+                              group=county)) +
+      geom_line(aes(color=county),
+                show.legend=FALSE) +
+      facet_wrap(~sector) +
+      labs(y="Weekly average visits (normalized)",
+           color="County",
+           title="Santa Clara vs. San Mateo (2020)") +
+      theme_classic() +
+      theme(axis.title.x = element_blank(),
+            plot.title = element_text(hjust = 0.5, size=12,face="bold"),
+            legend.position = "top",
+            legend.title=element_text(size=10),
+            strip.background = element_blank()) +
+      scale_x_continuous(breaks=c(40.25,44.9,49.1,53.5,58),
+                         labels=month_labels,
+                         limits = (c(40,60))) + 
+      scale_color_manual(values = c("San Mateo" = "#559B06",
+                                    "Santa Clara" = "#E10077"))+
+      ylim(0,1)+
+      geom_vline(xintercept = 49.5, linetype="dotted", 
+                color = "#212121", size=1) +
+      geom_vline(xintercept = 51.5, linetype="dotted", 
+                color = "#559B06", size=1) +
+      geom_text(mapping=aes(x=49.5, 
+                            y=0, 
+                            label="20% order"), 
+                size=3.5, 
+                family="Helvetica", 
+                angle=90, 
+                vjust=-0.8,
+                hjust=0, 
+                color="#212121",
+                check_overlap = TRUE)
+
+  #  geom_text(x = 42.75, y = 1, label="Santa Clara",
+  #            color="#E10077",check_overlap = TRUE, size=3, inherit.aes = FALSE)+
+  #  geom_text(x = 42.5, y = .75, label="San Mateo",
+  #            color="#559B06",check_overlap = TRUE, size=3, inherit.aes = FALSE)
+
+#Create SCC Year Over Year Comparison
+scc_yoy <- ggplot(filter(normalized,county=="Santa Clara" & week_mod >40 & week_mod <62), 
+                  mapping=aes(x=week_mod,
+                              y=avg_weekly_visits,
+                              group=year_cohort)) +
+        geom_line(aes(color=year_cohort),show.legend=FALSE) +
+      facet_wrap(~sector, scales = "free_y") +
+      labs(y="Weekly average visits (SCC)",
+           color="Year",
+           title = "Santa Clara County (2020 vs. 2019)") +
+      theme_classic() +
+      theme(axis.title.x = element_blank(),
+            legend.position="top",
+            legend.title=element_text(size=10),
+            plot.title = element_text(hjust = 0.5,size=12,face="bold"),
+            strip.background = element_blank()) +
+      scale_x_continuous(breaks=c(40.25,44.9,49.1,53.5,58),
+                         labels=month_labels) + 
+      scale_color_manual(values = c("2019-2020" = "#559B06",
+                                    "2020-2021" = "#E10077"
+                                    ))+
+      #ylim(0,1)+ #only used this for normalized
+      geom_vline(xintercept = 49.5, linetype="dotted", 
+                color = "#212121", size=1) +
+      geom_text(mapping=aes(x=49.5, 
+                            y=0, 
+                            label="20% order"), 
+                size=3.5, 
+                family="Helvetica", 
+                angle=90, 
+                vjust=-0.8,
+                hjust=0, 
+                color="#212121",
+                check_overlap = TRUE)
+
+#Combine Plots
+DiD_figures <- ggarrange(scc_yoy, scc_v_smc,
+                        ncol=1,
+                        nrow=2)
+
+ggsave("did_figures.png",width=8,height=6)
+
+#Create SCC Year Over Year Comparison: By Size
+scc_yoy_size <- ggplot(filter(filter(figure_weekly_size, !is.na(top_half)),county=="Santa Clara" & week_mod >40 & week_mod <62), 
+                  mapping=aes(x=week_mod,
+                              y=avg_weekly_visits,
+                              group=year_cohort)) +
+        geom_line(aes(color=year_cohort)) +
+      facet_grid(~top_half~sector, 
+                 scales = "free_y") +
+      labs(y="Weekly average visits (SCC)",
+           color="Year") +
+      theme_classic() +
+      theme(axis.title.x = element_blank(),
+            legend.position="bottom",
+            strip.background = element_blank()) +
+      scale_x_continuous(breaks=c(40.25,44.9,49.1,53.5,58),
+                         labels=month_labels) + 
+      scale_color_manual(values = c("2019-2020" = "#559B06",
+                                    "2020-2021" = "#E10077"
+                                    ))+
+      #ylim(0,1)+ #only used this for normalized
+      geom_vline(xintercept = 49.5, linetype="dotted", 
+                color = "#212121", size=1) +
+      geom_text(mapping=aes(x=49.5, 
+                            y=0, 
+                            label="20% order"), 
+                size=3.5, 
+                family="Helvetica", 
+                angle=90, 
+                vjust=-0.8,
+                hjust=0, 
+                color="#212121",
+                check_overlap = TRUE)
+
+ggsave("yoy_size.png",height=6,width=10)
+
+```
+
+```{r Figure 2 - sectors}
+month_labels <- c("Oct", "Nov", "Dec", "Jan", "Feb")
+
+#Create SCC vs SMC Comparison
+scc_smc <- filter(normalized, county=="Santa Clara" | county=="San Mateo") %>%
+  filter(week_mod > 40 & year_cohort=="2020-2021") %>%
+  filter(sector=="General Merchandise Stores")
+
+# A data frame with labels for each facet
+scc_v_smc <- ggplot(scc_smc, 
+                  mapping=aes(x=week_mod,
+                              y=norm_weekly_visits,
+                              group=county)) +
+      geom_line(aes(color=county),
+                show.legend=FALSE) +
+      facet_wrap(~sector) +
+      labs(y="Weekly average visits (normalized)",
+           color="County",
+           title="Santa Clara vs. San Mateo (2020)") +
+      theme_classic() +
+      theme(axis.title.x = element_blank(),
+            plot.title = element_text(hjust = 0.5, size=12,face="bold"),
+            legend.position = "top",
+            legend.title=element_text(size=10),
+            strip.background = element_blank()) +
+      scale_x_continuous(breaks=c(40.25,44.9,49.1,53.5,58),
+                         labels=month_labels,
+                         limits = (c(40,60))) + 
+      scale_color_manual(values = c("San Mateo" = "#559B06",
+                                    "Santa Clara" = "#E10077"))+
+      ylim(0,1)+
+      geom_vline(xintercept = 49.5, linetype="dotted", 
+                color = "#212121", size=1) +
+      geom_vline(xintercept = 51.5, linetype="dotted", 
+                color = "#559B06", size=1) +
+      geom_text(mapping=aes(x=49.5, 
+                            y=0, 
+                            label="20% order"), 
+                size=3.5, 
+                family="Helvetica", 
+                angle=90, 
+                vjust=-0.8,
+                hjust=0, 
+                color="#212121",
+                check_overlap = TRUE) +
+      geom_text(mapping=aes(x=42, 
+                            y=0.75, 
+                            label="San Mateo"), 
+                size=3.5, 
+                family="Helvetica", 
+                #vjust=-0.8,
+                #hjust=0, 
+                color="#559B06",
+                check_overlap = TRUE) +
+      geom_text(mapping=aes(x=42, 
+                            y=0.97, 
+                            label="Santa Clara"), 
+                size=3.5, 
+                family="Helvetica", 
+                #vjust=-0.8,
+                #hjust=0, 
+                color="#E10077",
+                check_overlap = TRUE)
+
+#Create SCC Year Over Year Comparison
+scc_data <- normalized %>%
+  filter(county=="Santa Clara" & week_mod >40 & week_mod <62) %>%
+  filter(sector=="General Merchandise Stores")
+
+scc_yoy <- ggplot(scc_data, 
+                  mapping=aes(x=week_mod,
+                              y=norm_weekly_visits,
+                              group=year_cohort)) +
+        geom_line(aes(color=year_cohort),show.legend=FALSE) +
+      facet_wrap(~sector, scales = "free_y") +
+      labs(y="Weekly average visits (normalized)",
+           color="Year",
+           title = "Santa Clara County (2020 vs. 2019)") +
+      theme_classic() +
+      theme(axis.title.x = element_blank(),
+            legend.position="top",
+            legend.title=element_text(size=10),
+            plot.title = element_text(hjust = 0.5,size=12,face="bold"),
+            strip.background = element_blank()) +
+      scale_x_continuous(breaks=c(40.25,44.9,49.1,53.5,58),
+                         labels=month_labels) + 
+      scale_color_manual(values = c("2019-2020" = "#559B06",
+                                    "2020-2021" = "#E10077"
+                                    ))+
+      #ylim(0,1)+ #only used this for normalized
+      geom_vline(xintercept = 49.5, linetype="dotted", 
+                color = "#212121", size=1) +
+      geom_text(mapping=aes(x=49.5, 
+                            y=0, 
+                            label="20% order"), 
+                size=3.5, 
+                family="Helvetica", 
+                angle=90, 
+                vjust=-0.8,
+                hjust=0, 
+                color="#212121",
+                check_overlap = TRUE) +
+      geom_text(mapping=aes(x=43, 
+                            y=0.67, 
+                            label="2019-2020"), 
+                size=3.5, 
+                family="Helvetica", 
+                #vjust=-0.8,
+                #hjust=0, 
+                color="#559B06",
+                check_overlap = TRUE) +
+      geom_text(mapping=aes(x=43, 
+                            y=0.97, 
+                            label="2020-2021"), 
+                size=3.5, 
+                family="Helvetica", 
+                #vjust=-0.8,
+                #hjust=0, 
+                color="#E10077",
+                check_overlap = TRUE)
+
+#Combine Plots
+DiD_figures <- ggarrange(scc_yoy, scc_v_smc,
+                        ncol=2,
+                        nrow=1)
+
+ggsave("did_figure_general_merchandise.pdf",width=8,height=4)
+```
+
+```{r Figure 2 - all combined}
+month_labels <- c("Oct", "Nov", "Dec", "Jan", "Feb")
+
+sector_colors = c(
+  'Groceries' = '#D95F02',
+  'Pharmacies' = '#1B9E77',
+  'General Merchandise Stores' = '#7570B3')
+
+#Create SCC vs SMC Comparison
+
+scc_smc <- filter(normalized, county=="Santa Clara" | county=="San Mateo") %>%
+  filter(week_mod > 40 & year_cohort=="2020-2021")
+
+scc_smc_diff <- filter(scc_smc,county=="San Mateo") %>%
+  left_join(filter(scc_smc,county=="Santa Clara"),by=c("sector","week","year")) %>%
+  mutate(diff_norm_visits=norm_weekly_visits.x-norm_weekly_visits.y) %>%
+  select(week_mod.x,diff_norm_visits,sector)
+
+# A data frame with labels for each facet
+scc_v_smc <- ggplot(scc_smc_diff, 
+                  mapping=aes(x=week_mod.x,
+                              y=diff_norm_visits,
+                              group=sector)) +
+      geom_line(aes(color=sector),
+                show.legend=TRUE) +
+      labs(y="Normalized difference in visits (San Mateo minus Santa Clara)",
+           color="Sector",
+           title="San Mateo vs. Santa Clara (2020)") +
+      theme_classic() +
+      theme(axis.title.x = element_blank(),
+            plot.title = element_text(hjust = 0.5, size=12,face="bold"),
+            legend.position = "top",
+            legend.title=element_text(size=10),
+            strip.background = element_blank()) +
+      scale_x_continuous(breaks=c(40.25,44.9,49.1,53.5,58),
+                         labels=month_labels,
+                         limits = (c(40,60))) + 
+      scale_color_manual(values = sector_colors) +
+      ylim(-0.25,0.25)+
+      geom_vline(xintercept = 49.5, linetype="dotted", 
+                color = "#212121", size=1) +
+      geom_vline(xintercept = 51.5, linetype="dotted", 
+                color = "#559B06", size=1) +
+      geom_text(mapping=aes(x=49.5, 
+                            y=-0.2, 
+                            label="20% order"), 
+                size=3.5, 
+                family="Helvetica", 
+                angle=90, 
+                vjust=-0.8,
+                hjust=0, 
+                color="#212121",
+                check_overlap = TRUE)
+
+#Create SCC Year Over Year Comparison
+scc_data <- normalized %>%
+  filter(county=="Santa Clara" & week_mod >40 & week_mod <62)
+
+scc_diff <- filter(scc_data,year_cohort=="2020-2021") %>%
+  left_join(filter(scc_data,year_cohort=="2019-2020"),by=c("sector","week_mod")) %>%
+  mutate(diff_norm_visits=norm_weekly_visits.x-norm_weekly_visits.y) %>%
+  select(week_mod,diff_norm_visits,sector)
+
+scc_yoy <- ggplot(scc_diff, 
+                  mapping=aes(x=week_mod,
+                              y=diff_norm_visits,
+                              group=sector)) +
+        geom_line(aes(color=sector),show.legend=TRUE) +
+      labs(y="Normalized difference in visits (2020 minus 2019)",
+           color="Sector",
+           title = "Santa Clara County (2020 vs. 2019)") +
+      theme_classic() +
+      theme(axis.title.x = element_blank(),
+            legend.position="top",
+            legend.title=element_text(size=10),
+            plot.title = element_text(hjust = 0.5,size=12,face="bold"),
+            strip.background = element_blank()) +
+      scale_x_continuous(breaks=c(40.25,44.9,49.1,53.5,58),
+                         labels=month_labels,
+                         limits = (c(40,60))) + 
+      scale_color_manual(values = sector_colors)+
+      ylim(-0.25,0.25)+ 
+      geom_vline(xintercept = 49.5, linetype="dotted", 
+                color = "#212121", size=1) +
+      geom_text(mapping=aes(x=49.5, 
+                            y=-0.2, 
+                            label="20% order"), 
+                size=3.5, 
+                family="Helvetica", 
+                angle=90, 
+                vjust=-0.8,
+                hjust=0, 
+                color="#212121",
+                check_overlap = TRUE)
+
+#Combine Plots
+DiD_figures <- ggarrange(scc_yoy, scc_v_smc,
+                        ncol=2,
+                        nrow=1)
+
+ggsave("did_figures.png",width=8,height=6)
+```
+
+## DiD Results
+```{r SCC YoY}
+sectors <- unique(all_county_data$sector)
+
+results_yoy <- data.frame(
+  metric=character(),
+  sector=character(),
+  event_date=character(),
+  result=character(),
+  lower_bound=character(),
+  upper_bound=character(),
+  standard_error=character(),
+  p_value=character(),
+  stringsAsFactors = F
+)
+
+results_yoy[1, ] <- c(
+  'test','test','2020-10-05',"3","3","3","3","3"
+)
+
+event_date <- "2020-12-07"
+date_2020 <- ymd(event_date)
+min_2020 <- date_2020 - weeks(6)
+pre_end <- date_2020 - days(1)
+max_2020 <- date_2020 + weeks(6) - days(1)
+date_2019 <- date_2020 - years(1) + days(2)
+min_2019 <- min_2020 - years(1) + days(2)
+pre_end_2019 <- pre_end - years(1) + days(2)
+max_2019 <- max_2020 - years(1) + days(2)
+
+print(paste(min_2020, pre_end))
+print(paste(date_2020, max_2020))
+
+print(paste(min_2019, pre_end_2019))
+print(paste(date_2019, max_2019))
+
+relevant_dates <- santa_clara_data %>%
+  filter((date>=min_2020 & date<=pre_end) |
+    (date>=date_2020 & date<=max_2020)|
+    (date>=min_2019 & date<=pre_end_2019) |
+    (date>=date_2019 & date<=max_2019)) %>%
+  mutate(treatment=ifelse(date>max_2019,1,0))%>%
+  mutate(time=ifelse((date>=date_2020 & date<=max_2020)|(date>=date_2019 & date<=max_2019),1,0)) %>%
+  filter(sector != "restaurant")
+
+summary <- relevant_dates %>% 
+  group_by(treatment,time,sector) %>% 
+  summarise(avg_daily_visits=mean(daily_visits),
+            avg_peak_hourly_visits=mean(peak_hourly_visits),
+            median_time=median(median_dwell))
+
+write.csv(summary,"scc_yoy.csv")
+
+sectors <- unique(relevant_dates$sector)
+  
+for (s in sectors){
+  did_table <- relevant_dates %>%
+    filter(sector==s)
+  
+  visits<-lm(formula=daily_visits~time*treatment,did_table)
+  v <- conf_int(visits, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  v2 <- (coef_test(visits, 
+          vcov = "CR1", 
+          cluster = did_table$safegraph_place_id, 
+          test = "naive-t")[1:4,])$p_t[4]
+  peak<-lm(formula=peak_hourly_visits~time*treatment,did_table)
+  p <- conf_int(peak, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  p2 <- (coef_test(peak, 
+          vcov = "CR1", 
+          cluster = did_table$safegraph_place_id, 
+          test = "naive-t")[1:4,])$p_t[4]
+  dwell<-lm(formula=median_dwell~time*treatment,did_table)
+  d <- conf_int(dwell, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  d2 <- (coef_test(dwell, 
+    vcov = "CR1", 
+    cluster = did_table$safegraph_place_id, 
+    test = "naive-t")[1:4,])$p_t[4]
+  
+  results_yoy <- results_yoy %>%
+    rbind(c("Visits",s,event_date,v$beta[4],v$CI_L[4],v$CI_U[4],v$SE[4],v2)) %>%
+    rbind(c("Peak Hourly Visits",s,event_date,p$beta[4],p$CI_L[4],p$CI_U[4],p$SE[4],p2)) %>%
+    rbind(c("Median Dwell Time",s,event_date,d$beta[4],d$CI_L[4],d$CI_U[4],d$SE[4],d2))
+}
+
+results_yoy <- results_yoy %>% filter(sector != "test")
+results_yoy$result <- as.numeric(results_yoy$result)
+results_yoy$lower_bound <- as.numeric(results_yoy$lower_bound)
+results_yoy$upper_bound <- as.numeric(results_yoy$upper_bound)
+results_yoy$standard_error <- as.numeric(results_yoy$standard_error)
+results_yoy$p_value <- as.numeric(results_yoy$p_value)
+results_yoy$event_date <- ymd(results_yoy$event_date)
+
+write.csv(results_yoy,"results_yoy.csv")
+```
+
+```{r SMC vs SCC}
+all_county_data <- all_county_data %>%
+  mutate(treatment=ifelse(county=="Santa Clara",1,0))
+
+counties <- unique(filter(all_county_data,county!="Santa Clara")$county) 
+sectors <- unique(all_county_data$sector)
+
+results_smc <- data.frame(
+  metric=character(),
+  sector=character(),
+  event_date=character(),
+  result=character(),
+  lower_bound=character(),
+  upper_bound=character(),
+  standard_error=character(),
+  p_value=character(),
+  stringsAsFactors = F
+)
+
+results_smc[1, ] <- c(
+ 'test','test','2020-10-03',"3","3","3","3","3"
+)
+ 
+event_date <- "2020-12-07"
+date_2020 <- ymd(event_date)
+min_2020 <- date_2020 - weeks(6)
+pre_end <- date_2020 - days(1)
+max_2020 <- date_2020 + days(10)
+
+print(paste(min_2020, pre_end))
+print(paste(date_2020, max_2020))
+  
+relevant_dates <- all_county_data %>%
+  filter(
+    (date >= min_2020 & date <= pre_end) | (date >= date_2020 & date <= max_2020)
+  ) %>%
+  mutate(time=ifelse(date >= date_2020,1,0))
+
+summary <- relevant_dates %>% 
+  filter(county=="San Mateo" | county=="Santa Clara") %>% 
+  group_by(treatment,time,sector) %>% 
+      summarise(avg_daily_visits=mean(daily_visits),
+                avg_peak_hourly_visits=mean(peak_hourly_visits),
+                median_time=median(median_dwell))
+
+write.csv(summary,"scc_smc2.csv")
+
+sectors <- unique(relevant_dates$sector)
+
+for (s in sectors){
+  did_table <- relevant_dates %>%
+    filter(county=="San Mateo" | county=="Santa Clara") %>%
+    filter(sector==s)
+  
+  visits<-lm(formula=daily_visits~time*treatment,did_table)
+  v <- conf_int(visits, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  v2 <- (coef_test(visits, 
+          vcov = "CR1", 
+          cluster = did_table$safegraph_place_id, 
+          test = "naive-t")[1:4,])$p_t[4]
+  peak<-lm(formula=peak_hourly_visits~time*treatment,did_table)
+  p <- conf_int(peak, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  p2 <- (coef_test(peak, 
+          vcov = "CR1", 
+          cluster = did_table$safegraph_place_id, 
+          test = "naive-t")[1:4,])$p_t[4]
+  dwell<-lm(formula=median_dwell~time*treatment,did_table)
+  d <- conf_int(dwell, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  d2 <- (coef_test(dwell, 
+          vcov = "CR1", 
+          cluster = did_table$safegraph_place_id, 
+          test = "naive-t")[1:4,])$p_t[4]
+  
+  results_smc <- results_smc %>%
+    rbind(c("Visits",s,event_date,v$beta[4],v$CI_L[4],v$CI_U[4],v$SE[4],v2)) %>%
+    rbind(c("Peak Hourly Visits",s,event_date,p$beta[4],p$CI_L[4],p$CI_U[4],p$SE[4],p2)) %>%
+    rbind(c("Median Dwell Time",s,event_date,d$beta[4],d$CI_L[4],d$CI_U[4],d$SE[4],d2))
+}
+
+ results_smc <- results_smc %>% filter(sector != "test")
+ results_smc$result <- as.numeric(results_smc$result) 
+ results_smc$lower_bound <- as.numeric(results_smc$lower_bound) 
+ results_smc$upper_bound <- as.numeric(results_smc$upper_bound)
+ results_smc$standard_error <- as.numeric(results_smc$standard_error)
+ results_smc$p_value <- as.numeric(results_smc$p_value) 
+ results_smc$event_date <- ymd(results_smc$event_date)
+ 
+ write.csv(results_smc,"results_smc.csv")
+```
+
+```{r SCC YoY - Bottom Half}
+sectors <- unique(all_county_data$sector)
+
+results_yoy <- data.frame(
+  metric=character(),
+  sector=character(),
+  event_date=character(),
+  result=character(),
+  lower_bound=character(),
+  upper_bound=character(),
+  standard_error=character(),
+  p_value=character(),
+  stringsAsFactors = F
+)
+
+results_yoy[1, ] <- c(
+  'test','test','2020-10-05',"3","3","3","3","3"
+)
+
+event_date <- "2020-12-07"
+date_2020 <- ymd(event_date)
+min_2020 <- date_2020 - weeks(6)
+pre_end <- date_2020 - days(1)
+max_2020 <- date_2020 + weeks(6) - days(1)
+date_2019 <- date_2020 - years(1) + days(2)
+min_2019 <- min_2020 - years(1) + days(2)
+pre_end_2019 <- pre_end - years(1) + days(2)
+max_2019 <- max_2020 - years(1) + days(2)
+
+print(paste(min_2019, pre_end_2019))
+print(paste(date_2019, max_2019))
+
+relevant_dates <- santa_clara_data %>%
+  filter((date>=min_2020 & date<=pre_end) |
+    (date>=date_2020 & date<=max_2020)|
+    (date>=min_2019 & date<=pre_end_2019) |
+    (date>=date_2019 & date<=max_2019)) %>%
+  mutate(treatment=ifelse(date>max_2019,1,0))%>%
+  mutate(time=ifelse(
+    (date>=date_2020 & date<=max_2020) | (date>=date_2019 & date<=max_2019),1,0)
+  ) %>%
+  left_join(size_mapping,by="safegraph_place_id") %>%
+  filter(top_half=="Bottom Half") %>%
+  mutate(sector=sector.x)
+  
+summary <- relevant_dates %>% 
+  group_by(treatment,time,sector) %>% 
+  summarise(avg_daily_visits=mean(daily_visits),
+            avg_peak_hourly_visits=mean(peak_hourly_visits),
+            median_time=median(median_dwell))
+
+write.csv(summary,"yoy_size.csv")
+  
+sectors <- unique(relevant_dates$sector)
+  
+for (s in sectors){
+  did_table <- relevant_dates %>%
+    filter(sector==s)
+  
+  visits<-lm(formula=daily_visits~time*treatment,did_table)
+  v <- conf_int(visits, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  v2 <- (coef_test(visits, 
+          vcov = "CR1", 
+          cluster = did_table$safegraph_place_id, 
+          test = "naive-t")[1:4,])$p_t[4]
+  peak<-lm(formula=peak_hourly_visits~time*treatment,did_table)
+  p <- conf_int(peak, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  p2 <- (coef_test(peak, 
+          vcov = "CR1", 
+          cluster = did_table$safegraph_place_id, 
+          test = "naive-t")[1:4,])$p_t[4]
+  dwell<-lm(formula=median_dwell~time*treatment,did_table)
+  d <- conf_int(dwell, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  d2 <- (coef_test(dwell, 
+    vcov = "CR1", 
+    cluster = did_table$safegraph_place_id, 
+    test = "naive-t")[1:4,])$p_t[4]
+  
+  results_yoy <- results_yoy %>%
+    rbind(c("Visits",s,event_date,v$beta[4],v$CI_L[4],v$CI_U[4],v$SE[4],v2)) %>%
+    rbind(c("Peak Hourly Visits",s,event_date,p$beta[4],p$CI_L[4],p$CI_U[4],p$SE[4],p2)) %>%
+    rbind(c("Median Dwell Time",s,event_date,d$beta[4],d$CI_L[4],d$CI_U[4],d$SE[4],d2))
+}
+
+results_yoy <- results_yoy %>% filter(sector != "test")
+results_yoy$result <- as.numeric(results_yoy$result) 
+results_yoy$lower_bound <- as.numeric(results_yoy$lower_bound) 
+results_yoy$upper_bound <- as.numeric(results_yoy$upper_bound)
+results_yoy$standard_error <- as.numeric(results_yoy$standard_error) 
+results_yoy$p_value <- as.numeric(results_yoy$p_value) 
+results_yoy$event_date <- ymd(results_yoy$event_date)
+
+write.csv(results_yoy,"results_yoy_half.csv")
+```
+
+```{r Pooled - all bay area}
+pooled <- all_county_data %>% filter(county != "Sonoma") %>%
+  mutate(treatment=ifelse(county %in% c("Santa Clara", 
+                                        "Alameda", 
+                                        "San Francisco",
+                                        "Marin",
+                                        "Contra Costa"),1,0))
+
+results <- data.frame(
+  metric=character(),
+  sector=character(),
+  event_date=character(),
+  result=character(),
+  lower_bound=character(),
+  upper_bound=character(),
+  standard_error=character(),
+  p_value=character(),
+  stringsAsFactors = F
+)
+
+results[1, ] <- c(
+  'test','test','2020-10-03',"3","3","3","3","3"
+)
+
+event_date <- "2020-12-07"
+date_2020 <- ymd(event_date)
+min_2020 <- date_2020 - weeks(6)
+pre_end <- date_2020 - days(1)
+max_2020 <- date_2020 + days(10)
+
+print(paste(min_2020, pre_end))
+print(paste(date_2020, max_2020))
+  
+relevant_dates <- all_county_data %>%
+  filter(
+    (date >= min_2020 & date <= pre_end) | (date >= date_2020 & date <= max_2020)
+  ) %>%
+  mutate(time=ifelse(date >= date_2020,1,0))
+  
+summary <- relevant_dates %>% 
+  group_by(county,treatment,time,sector) %>% 
+  summarise(avg_daily_visits=mean(daily_visits),
+            avg_peak_hourly_visits=mean(peak_hourly_visits),
+            median_time=median(median_dwell))
+      
+write.csv(summary,"pooled.csv")
+  
+sectors <- unique(all_county_data$sector)
+
+for (s in sectors){
+  did_table <- relevant_dates %>%
+    filter(sector==s)
+  
+  visits<-lm(formula=daily_visits~time*treatment+as.factor(county),did_table)
+  v <- conf_int(visits, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  v2 <- (coef_test(visits, 
+          vcov = "CR1", 
+          cluster = did_table$safegraph_place_id, 
+          test = "naive-t")[1:4,])$p_t[4]
+  peak<-lm(formula=peak_hourly_visits~time*treatment+as.factor(county),did_table)
+  p <- conf_int(peak, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  p2 <- (coef_test(peak, 
+          vcov = "CR1", 
+          cluster = did_table$safegraph_place_id, 
+          test = "naive-t")[1:4,])$p_t[4]
+  dwell<-lm(formula=median_dwell~time*treatment+as.factor(county),did_table)
+  d <- conf_int(dwell, 
+                vcov = "CR1", 
+                cluster = did_table$safegraph_place_id, 
+                test = "naive-t")[1:4,]
+  d2 <- (coef_test(dwell, 
+    vcov = "CR1", 
+    cluster = did_table$safegraph_place_id, 
+    test = "naive-t")[1:4,])$p_t[4]
+  
+  results <- results %>%
+    rbind(c("Visits",s,event_date,v$beta[4],v$CI_L[4],v$CI_U[4],v$SE[4],v2)) %>%
+    rbind(c("Peak Hourly Visits",s,event_date,p$beta[4],p$CI_L[4],p$CI_U[4],p$SE[4],p2)) %>%
+    rbind(c("Median Dwell Time",s,event_date,d$beta[4],d$CI_L[4],d$CI_U[4],d$SE[4],d2))
+}
+
+results <- results %>% filter(sector != "test")
+results$result <- as.numeric(results$result) 
+results$lower_bound <- as.numeric(results$lower_bound) 
+results$upper_bound <- as.numeric(results$upper_bound)
+results$standard_error <- as.numeric(results$standard_error) 
+results$p_value <- as.numeric(results$p_value) 
+results$event_date <- ymd(results$event_date)
+
+write.csv(results,"results_pooled.csv")
+```
+
+## Lead tests
+```{r multi-county lead tests - no bootstrap}
+all_county_data <- all_county_data %>%
+  mutate(treatment=ifelse(county=="Santa Clara",1,0))
+
+counties <- unique(filter(all_county_data,county!="Santa Clara")$county) 
+sectors <- unique(all_county_data$sector)
+
+# event_dates <- as.character(seq(mdy("10-3-20"), mdy("11-02-20"), by = "days"))
+event_dates <- as.character(seq(mdy("10-30-20"), mdy("11-26-20"), by = "days"))
+
+results <- data.frame(
+  metric=character(),
+  control_county=character(),
+  sector=character(),
+  event_date=character(),
+  result=character(),
+  lower_bound=character(),
+  upper_bound=character(),
+  standard_error=character(),
+  stringsAsFactors = F
+)
+
+results[1, ] <- c(
+  'test','test','test','2020-10-03',"3","3","3","3"
+)
+
+ 
+for (event_date in event_dates){
+  date_2020 <- ymd(event_date)
+  min_2020 <- date_2020 - weeks(6)
+  pre_end <- date_2020 - days(1)
+  max_2020 <- date_2020 + days(10)
+  
+  print(paste(min_2020, pre_end))
+  print(paste(date_2020, max_2020))
+  
+  relevant_dates <- all_county_data %>%
+    filter(
+      (date >= min_2020 & date <= pre_end) | (date >= date_2020 & date <= max_2020)
+    ) %>%
+    mutate(time=ifelse(date >= date_2020,1,0))
+  
+  for (c in counties){
+    for (s in sectors){
+      did_table <- relevant_dates %>%
+        filter(county==c | county=="Santa Clara") %>%
+        filter(sector==s)
+      
+      visits<-lm(formula=daily_visits~time*treatment,did_table)
+      v <- conf_int(visits, 
+                    vcov = "CR1", 
+                    cluster = did_table$safegraph_place_id, 
+                    test = "naive-t")[1:4,]
+      peak<-lm(formula=peak_hourly_visits~time*treatment,did_table)
+      p <- conf_int(peak, 
+                    vcov = "CR1", 
+                    cluster = did_table$safegraph_place_id, 
+                    test = "naive-t")[1:4,]
+      dwell<-lm(formula=median_dwell~time*treatment,did_table)
+      d <- conf_int(dwell, 
+                    vcov = "CR1", 
+                    cluster = did_table$safegraph_place_id, 
+                    test = "naive-t")[1:4,]
+      
+      results <- results %>%
+        rbind(c("Visits",c,s,event_date,v$beta[4],v$CI_L[4],v$CI_U[4],v$SE[4])) %>%
+        rbind(c("Peak Hourly Visits",c,s,event_date,p$beta[4],p$CI_L[4],p$CI_U[4],p$SE[4])) %>%
+        rbind(c("Median Dwell Time",c,s,event_date,d$beta[4],d$CI_L[4],d$CI_U[4],d$SE[4]))
+    }
+  }
+}
+
+results <- results %>% filter(sector != "test")
+results$result <- as.numeric(results$result) 
+results$lower_bound <- as.numeric(results$lower_bound) 
+results$upper_bound <- as.numeric(results$upper_bound)
+results$standard_error <- as.numeric(results$standard_error) 
+results$event_date <- ymd(results$event_date)
+```
+
+```{r plot multi-county lead tests}
+nov_labels <- c("Nov 1", "Nov 15","Nov 30")
+
+results <- results %>%
+     mutate(sector = ifelse(sector=="big_box", "General Merchandise Stores", sector),
+     sector = ifelse(sector=="pharmacy", "Pharmacies", sector),
+     sector = ifelse(sector=="grocery", "Groceries", sector))
+
+sectors <- unique(results$sector)
+metrics <- unique(results$metric)
+
+for(s in sectors){
+  i=1
+  for(m in metrics){
+    to_plot <- filter(results, metric==m & sector==s)
+    name <- paste0("plot",i) 
+    
+    plot_temp <-
+      ggplot(to_plot, aes(x=event_date, y=result)) + 
+      geom_point(stat = "identity") +
+      geom_errorbar(aes(ymin=lower_bound, ymax=upper_bound), width=.005,color="gray") +
+      facet_grid(~control_county,
+                 scale="free_y") + 
+      labs(title=m) +
+      scale_x_date(breaks=as.Date(c("2020-11-01","2020-11-15","2020-11-30")),
+                   labels=nov_labels,
+                   limits = as.Date(c("2020-10-28","2020-11-30"))) +
+      theme_classic() +
+      geom_hline(yintercept = 0, linetype="dotted", 
+                    color = "red", size=0.5) +
+      theme(axis.title.x = element_blank(),
+            axis.title.y = element_blank(),
+            plot.title=element_text(size=10))
+    
+    assign(name, plot_temp,envir=.GlobalEnv)
+    
+    i=i+1
+  }
+  sector_name <- paste0("all_metrics_",s) 
+  plot4 <- ggarrange(plot1, plot2, plot3,
+                        ncol=1,
+                        nrow=3)
+  plot5 <- annotate_figure(plot4,
+                  top=text_grob(s),
+                  left = text_grob("Estimated DiD result (with 95% CI)",rot=90),
+                  bottom=text_grob("Date of simulation")
+  )
+  assign(sector_name,plot5,envir=.GlobalEnv)
+      
+}
+  
+`all_metrics_General Merchandise Stores`
+ggsave("lead_all_big_box.png",width=10,height=7)
+all_metrics_Groceries
+ggsave("lead_all_grocery.png",width=10,height=7)
+all_metrics_Pharmacies
+ggsave("lead_all_pharmacy.png",width=10,height=7)
+
+```
+
+```{r plot SMC vs SCC lead test}
+to_plot <- filter(results, control_county=="San Mateo") %>%
+    mutate(sector = ifelse(sector=="big_box", "General Merchandise Stores", sector),
+         sector = ifelse(sector=="pharmacy", "Pharmacies", sector),
+         sector = ifelse(sector=="grocery", "Groceries", sector)) %>%
+  mutate(sector=factor(sector, 
+                       levels=c("Groceries","Pharmacies","General Merchandise Stores"))
+         )
+
+nov_labels <- c("Nov 1", "Nov 15","Nov 30")
+
+plot_temp <-
+      ggplot(to_plot, aes(x=event_date, y=result)) + 
+      geom_point(stat = "identity") +
+      geom_errorbar(aes(ymin=lower_bound, ymax=upper_bound), width=.005,color="gray") +
+      facet_grid(~metric~sector,
+                 scale="free_y") + 
+      labs(title="Lead Tests for Santa Clara vs. San Mateo County",
+           x="Date of simulation",
+           y="Estimated DiD result (with 95% CI)") +
+      scale_x_date(breaks=as.Date(c("2020-11-01","2020-11-15","2020-11-30")),
+                   labels=nov_labels,
+                   limits = as.Date(c("2020-10-28","2020-11-30"))) +
+      theme_classic() +
+      geom_hline(yintercept = 0, linetype="dotted", 
+                    color = "red", size=0.5) +
+      theme(plot.title=element_text(size=10))
+
+ggsave("lead_scc_smc.png",height=6, width=8)
+```
+
+```{r SCC YoY lead test - no bootstrap}
+event_dates <- as.character(seq(mdy("9-29-20"), mdy("10-26-20"), by = "days"))
+# event_dates <- as.character(seq(mdy("10-3-20"), mdy("11-02-20"), by = "days"))
+#event_dates <- as.character(seq(mdy("12-05-20"), mdy("12-05-20"), by = "days"))
+
+results <- data.frame(
+  metric=character(),
+  sector=character(),
+  event_date=character(),
+  result=character(),
+  lower_bound=character(),
+  upper_bound=character(),
+  standard_error=character(),
+  stringsAsFactors = F
+)
+
+results[1, ] <- c(
+  'test','test','2020-10-03',"3","3","3","3"
+)
+
+sectors <- unique(filter(santa_clara_data, sector != "restaurant")$sector)
+
+for (event_date in event_dates){
+ 
+  date_2020 <- ymd(event_date)
+  min_2020 <- date_2020 - weeks(6)
+  pre_end <- date_2020 - days(1)
+  max_2020 <- date_2020 + weeks(6) - days(1)
+  date_2019 <- date_2020 - years(1) + days(2)
+  min_2019 <- min_2020 - years(1) + days(2)
+  pre_end_2019 <- pre_end - years(1) + days(2)
+  max_2019 <- max_2020 - years(1) + days(2)
+  
+  print(paste(min_2020, pre_end))
+  print(paste(date_2020, max_2020))
+  
+  print(paste(min_2019, pre_end_2019))
+  print(paste(date_2019, max_2019))
+  
+  relevant_dates <- santa_clara_data %>%
+    filter(
+      (date>=min_2020 & date<=pre_end) | (date>=date_2020 & date<=max_2020) |
+      (date>=min_2019 & date<=pre_end_2019) | (date>=date_2019 & date<=max_2019)
+    ) %>%
+    mutate(treatment=ifelse(date>max_2019,1,0))%>%
+    mutate(time=ifelse((date>=date_2020 & date<=max_2020)|(date>=date_2019 & date<=max_2019),1,0)) %>%
+    filter(sector != "restaurant")
+  
+  for (s in sectors){
+    did_table <- relevant_dates %>%
+      filter(sector==s)
+    
+    visits<-lm(formula=daily_visits~time*treatment,did_table)
+    v <- conf_int(visits, 
+                  vcov = "CR1", 
+                  cluster = did_table$safegraph_place_id, 
+                  test = "naive-t")[1:4,]
+    peak<-lm(formula=peak_hourly_visits~time*treatment,did_table)
+    p <- conf_int(peak, 
+                  vcov = "CR1", 
+                  cluster = did_table$safegraph_place_id, 
+                  test = "naive-t")[1:4,]
+    dwell<-lm(formula=median_dwell~time*treatment,did_table)
+    d <- conf_int(dwell, 
+                  vcov = "CR1", 
+                  cluster = did_table$safegraph_place_id, 
+                  test = "naive-t")[1:4,]
+    
+    results <- results %>%
+      rbind(c("Visits",s,event_date,v$beta[4],v$CI_L[4],v$CI_U[4],v$SE[4])) %>%
+      rbind(c("Peak Hourly Visits",s,event_date,p$beta[4],p$CI_L[4],p$CI_U[4],p$SE[4])) %>%
+      rbind(c("Median Dwell Time",s,event_date,d$beta[4],d$CI_L[4],d$CI_U[4],d$SE[4]))
+  } 
+}
+ 
+results <- results %>% filter(sector != "test") %>% filter(sector != 'restaurant')
+results$result <- as.numeric(results$result) 
+results$lower_bound <- as.numeric(results$lower_bound) 
+results$upper_bound <- as.numeric(results$upper_bound)
+results$standard_error <- as.numeric(results$standard_error) 
+results$event_date <- ymd(results$event_date)
+```
+
+```{r plot SCC YoY}
+to_plot <- results %>%
+    mutate(sector = ifelse(sector=="big_box", "General Merchandise Stores", sector),
+         sector = ifelse(sector=="pharmacy", "Pharmacies", sector),
+         sector = ifelse(sector=="grocery", "Groceries", sector)) %>%
+  mutate(sector=factor(sector, 
+                       levels=c("Groceries","Pharmacies","General Merchandise Stores"))
+         )
+
+oct_labels <- c("Oct 1", "Oct 15","Oct 30")
+
+plot_temp <-
+  ggplot(to_plot, aes(x=event_date, y=result)) + 
+  geom_point(stat = "identity") +
+  geom_errorbar(aes(ymin=lower_bound, ymax=upper_bound), width=.005,color="gray") +
+  facet_grid(~metric~sector,
+             scale="free_y") + 
+  labs(title="Lead Tests for SCC 2020 vs. 2019",
+       x="Date of simulation",
+       y="Estimated DiD result (with 95% CI)") +
+  scale_x_date(breaks=as.Date(c("2020-10-01","2020-10-15","2020-10-30")),
+               labels=oct_labels,
+               limits = as.Date(c("2020-9-29","2020-10-31"))) +
+  theme_classic() +
+  geom_hline(yintercept = 0, linetype="dotted", 
+                color = "red", size=0.5) +
+  theme(plot.title=element_text(size=10))
+
+ggsave("lead_scc_yoy.png",width=8, height=6)
+```
+
+```{r bay area pooled - no bootstrap}
+pooled <- all_county_data %>% filter(county != "Sonoma") %>%
+  mutate(treatment=ifelse(county %in% c("Santa Clara", 
+                                        "Alameda", 
+                                        "San Francisco",
+                                        "Marin",
+                                        "Contra Costa"),1,0))
+
+sectors <- unique(all_county_data$sector)
+
+event_dates <- as.character(seq(mdy("10-30-20"), mdy("11-26-20"), by = "days"))
+# event_dates <- as.character(seq(mdy("10-3-20"), mdy("11-02-20"), by = "days"))
+#event_dates <- as.character(seq(mdy("12-05-20"), mdy("12-05-20"), by = "days"))
+
+results <- data.frame(
+  metric=character(),
+  sector=character(),
+  event_date=character(),
+  result=character(),
+  lower_bound=character(),
+  upper_bound=character(),
+  standard_error=character(),
+  stringsAsFactors = F
+)
+
+results[1, ] <- c(
+  'test','test','2020-10-03',"3","3","3","3"
+)
+
+for (event_date in event_dates){
+  
+  date_2020 <- ymd(event_date)
+  min_2020 <- date_2020 - weeks(6)
+  pre_end <- date_2020 - days(1)
+  max_2020 <- date_2020 + days(10)
+  
+  print(paste(min_2020, pre_end))
+  print(paste(date_2020, max_2020))
+  
+  relevant_dates <- pooled %>%
+    filter(
+      (date >= min_2020 & date <= pre_end) | (date >= date_2020 & date <= max_2020)
+    ) %>%
+    mutate(time=ifelse(date >= date_2020,1,0))
+  
+  for (s in sectors){
+    did_table <- relevant_dates %>%
+      filter(sector==s)
+    
+    visits<-lm(formula=daily_visits~time*treatment,did_table)
+    v <- conf_int(visits, 
+                  vcov = "CR1", 
+                  cluster = did_table$safegraph_place_id, 
+                  test = "naive-t")[1:4,]
+    peak<-lm(formula=peak_hourly_visits~time*treatment,did_table)
+    p <- conf_int(peak, 
+                  vcov = "CR1", 
+                  cluster = did_table$safegraph_place_id, 
+                  test = "naive-t")[1:4,]
+    dwell<-lm(formula=median_dwell~time*treatment,did_table)
+    d <- conf_int(dwell, 
+                  vcov = "CR1", 
+                  cluster = did_table$safegraph_place_id, 
+                  test = "naive-t")[1:4,]
+    
+    results <- results %>%
+      rbind(c("Visits",s,event_date,v$beta[4],v$CI_L[4],v$CI_U[4],v$SE[4])) %>%
+      rbind(c("Peak Hourly Visits",s,event_date,p$beta[4],p$CI_L[4],p$CI_U[4],p$SE[4])) %>%
+      rbind(c("Median Dwell Time",s,event_date,d$beta[4],d$CI_L[4],d$CI_U[4],d$SE[4]))
+  }
+}
+
+results <- results %>% filter(sector != "test")
+results$result <- as.numeric(results$result) 
+results$lower_bound <- as.numeric(results$lower_bound) 
+results$upper_bound <- as.numeric(results$upper_bound)
+results$standard_error <- as.numeric(results$standard_error)
+results$event_date <- ymd(results$event_date)
+```
+
+```{r plot bay area pooled lead tests}
+nov_labels <- c("Nov 1", "Nov 15","Nov 30")
+
+results <- results %>%
+     mutate(sector = ifelse(sector=="big_box", "General Merchandise Stores", sector),
+     sector = ifelse(sector=="pharmacy", "Pharmacies", sector),
+     sector = ifelse(sector=="grocery", "Groceries", sector))
+
+plot_temp <- 
+  ggplot(results, aes(x=event_date, y=result)) + 
+  geom_point(stat = "identity") +
+  geom_errorbar(aes(ymin=lower_bound, ymax=upper_bound), width=.005,color="gray") +
+  facet_grid(~sector~metric,
+             scale="free_y") + 
+  labs(title="Bay Area Pooled: Early vs. Late Adopter Lead Tests",
+       x="Estimated DiD result (with 95% CI)",
+       y="Date of simulation")+
+  scale_x_date(breaks=as.Date(c("2020-11-01","2020-11-15","2020-11-30")),
+               labels=nov_labels,
+               limits = as.Date(c("2020-10-28","2020-11-30"))) +
+  theme_classic() +
+  geom_hline(yintercept = 0, linetype="dotted", 
+                color = "red", size=0.5) +
+  theme(plot.title=element_text(size=10),
+        strip.background = element_blank())
+
+ggsave("lead_bay_area.png", height=6, width=8)
+```
+
+```{r one county plot example}
+all_county_visits <- 
+  ggplot(filter(results,metric=="Visits"&sector=="grocery"), 
+         aes(x=event_date, y=result)) + 
+  geom_point(stat = "identity") +
+  geom_errorbar(aes(ymin=lower_bound, ymax=upper_bound), width=.005,color="gray") +
+  facet_grid(~control_county,
+             scale="free_y") + 
+  labs(title="Estimated Diff-in-Diffs for Counties as Control") +
+  labs(y="Estimated DiD result (with 95% CI)",
+       x="Date of simulation") +
+  scale_x_date(breaks=as.Date(c("2020-10-01","2020-10-15","2020-10-30")),
+               labels=oct_labels,
+               limits = as.Date(c("2020-10-01","2020-11-05"))) +
+  theme_classic() +
+  geom_hline(yintercept = 0, linetype="dotted", 
+                color = "red", size=0.5) +
+  theme(axis.title.x = element_blank())
+```
+
+```{r histograms and ttest}
+did_results <- readRDS("did_results.rds")
+lead_tests <- readRDS("lead_tests_san_mateo.rds")
+
+vline <- did_results %>% select(metric, type, result1)
+
+hist <- ggplot()+
+  geom_histogram(
+    data=events, 
+    aes(x=result1),
+    bins=40,
+    position='identity',
+    fill="lightblue"
+  )+
+  geom_vline(aes(xintercept=result1),data=vline,linetype='dotted',color='black')+
+  facet_grid(metric~type,
+             scales='free')+
+  labs(title="San Mateo: Distribution of Dummy DiD Test Statistic from 10/3/20 to 11/2/20",
+       x="DiD Test Statistic",
+       y="Frequency (Count)") +
+  theme_classic()
+```
+
+## Event Analysis
+```{r event analysis for DiD}
+event_dates <- as.character(seq(mdy("08-01-20"), mdy("1-17-21"), by = "days"))
+# event_dates <- as.character(seq(mdy("9-29-20"), mdy("10-26-20"), by = "days"))
+# event_dates <- as.character(seq(mdy("08-01-20"), mdy("12-10-21"), by = "days"))
+
+event_study <- NULL
+
+# event_study[1, ] <- c('test',3,3,3,3,'2020-10-03')
+ 
+for (event_date in event_dates){
+  
+  date_2020 <- ymd(event_date)
+  min_2020 <- date_2020 - weeks(6)
+  pre_end <- date_2020 - days(1)
+  max_2020 <- date_2020 + weeks(6) - days(1)
+  
+  print(paste(min_2020, pre_end))
+  print(paste(date_2020, max_2020))
+
+  relevant_dates <- santa_clara_data %>%
+    filter(
+      (date>=min_2020 & date<=pre_end) | (date>=date_2020 & date<=max_2020)
+    ) %>%
+    mutate(time=ifelse((date>=date_2020 & date<=max_2020),1,0)) %>%
+    filter(sector != "restaurant")
+
+  event_table <- relevant_dates %>%
+    mutate(time=ifelse(date> date_2020, 1, 0)) %>%
+    select(
+      safegraph_place_id, 
+      date, 
+      time, 
+      sector,
+      peak_hourly_visits,
+      median_dwell, 
+      daily_visits
+    )
+  
+  event_data <- event_table %>%
+    group_by(sector,time) %>%
+    summarise(average_visits=mean(daily_visits),
+              average_peak_visits=mean(peak_hourly_visits),
+              average_time=mean(median_dwell)) %>%
+    mutate(event_date=date_2020)
+  
+  event_study <- event_study %>% rbind(event_data)
+}
+
+events_results <- event_study %>% filter(sector != "test") 
+events_results$average_visits <- as.numeric(events_results$average_visits) 
+events_results$average_peak_visits <- as.numeric(events_results$average_peak_visits) 
+events_results$average_time <- as.numeric(events_results$average_time) 
+events_results$event_date <- ymd(events_results$event_date) 
+
+events <- events_results %>% 
+  filter(time==0) %>%
+  inner_join(filter(events_results,time==1),by=c("event_date","sector")) %>%
+  mutate(post_pre_visits=average_visits.y - average_visits.x)
+
+events <- events %>% 
+  inner_join(
+    events %>% 
+      group_by(sector) %>% 
+      summarize(max_post_pre_visits = max(post_pre_visits)) %>% 
+      ungroup(),
+    by='sector'
+  ) %>% 
+  mutate(norm_post_pre_visits = post_pre_visits / max_post_pre_visits)
+
+events_wide <- events_results %>% 
+  pivot_wider(names_from = time, values_from = c(average_visits, average_peak_visits, average_time)) %>%
+  mutate(
+    post_pre_peak=average_peak_visits_1 - average_peak_visits_0,
+    post_pre_time=average_time_1 - average_time_0,
+    post_pre_visits=average_visits_1 - average_visits_0
+  ) %>%
+  filter(!is.na(post_pre_visits))
+
+events_wide <- events_wide %>% 
+  inner_join(
+    events_wide %>% 
+      group_by(sector) %>% 
+      summarize(
+        max_post_pre_peak = max(post_pre_peak),
+        max_post_pre_time = max(post_pre_time),
+        max_post_pre_visits = max(post_pre_visits)
+      ),
+    by='sector'
+  ) %>% 
+  mutate(
+    norm_post_pre_peak = post_pre_peak / max_post_pre_peak,
+    norm_post_pre_time = post_pre_time / max_post_pre_time,
+    norm_post_pre_visits = post_pre_visits / max_post_pre_visits
+  )
+
+events_long <- events_wide %>%
+  select(
+    sector, 
+    event_date,
+    norm_post_pre_peak,
+    norm_post_pre_time,
+    norm_post_pre_visits
+  ) %>%
+  pivot_longer(
+    cols= c(
+     "norm_post_pre_peak",
+     "norm_post_pre_time",
+     "norm_post_pre_visits"
+    ),
+    names_to=c("metric"),
+    values_to="post_pre"
+  )
+```
+
+```{r plot event study}
+events <- events %>%
+mutate(sector = ifelse(sector=="big_box", "General Merchandise Stores", sector),
+         sector = ifelse(sector=="pharmacy", "Pharmacies", sector),
+         sector = ifelse(sector=="grocery", "Groceries", sector)) %>%
+  mutate(sector=factor(sector, 
+                       levels=c("Groceries","Pharmacies","General Merchandise Stores"))
+          )%>%
+  mutate(Sector=sector)
+
+sector_colors = c(
+  'Groceries' = '#D95F02',
+  'Pharmacies' = '#1B9E77',
+  'General Merchandise Stores' = '#7570B3')
+
+event_study <- ggplot(data=filter(events,sector!="restaurant"), aes(x=event_date,y=norm_post_pre_visits,color=Sector))+
+  geom_point(stat = "identity") +
+  labs(title="Pre vs. post event studies") +
+  #scale_color_manual(values = c("2019" = "#117733", "2020" = "#882255")) +
+  labs(y="Normalized Post vs. Pre Difference in Visits",
+       x="Date of simulation") +
+  theme_classic() +
+  geom_vline(xintercept = as.Date('2020-12-06'), linetype="dotted", 
+                color = "black", size=1) +
+  geom_vline(xintercept = as.Date('2020-10-26'), linetype="dotted", 
+                color = "gray", size=1) +
+  theme(axis.title.x = element_blank())+
+  scale_color_manual(values = sector_colors)
+
+ggsave("event_study.png", height=6, width=8)
+
+```
+
+```{r plot event study as histogram}
+events_plot <- events_long %>%
+  mutate(sector = ifelse(sector=="big_box", "General Merchandise Stores", sector),
+         sector = ifelse(sector=="pharmacy", "Pharmacies", sector),
+         sector = ifelse(sector=="grocery", "Groceries", sector),
+         metric = ifelse(metric=="norm_post_pre_peak", "Peak Hourly Visits",metric),
+         metric = ifelse(metric=="norm_post_pre_time", "Median Dwell Time",metric),
+         metric = ifelse(metric=="norm_post_pre_visits", "Daily Visits",metric)) %>%
+  mutate(sector=factor(sector, 
+                       levels=c("Groceries","Pharmacies","General Merchandise Stores"))
+         )
+
+indicator_lines <- events_plot %>%
+  filter(event_date=='2020-12-07')%>%
+  filter(sector != 'restaurant')
+
+events_plot <- 
+  events_plot %>% 
+  filter(event_date>="2020-10-26" & event_date<="2021-01-17")
+#  filter(event_date>="2020-09-29" & event_date<="2020-10-26")
+
+sectors <- unique(indicator_lines$sector)
+metrics <- unique(indicator_lines$metric)
+
+indicator_values<-data.frame(
+  sector=double(),
+  metric=character(),
+  pre_post=character(), 
+  stringsAsFactors = F
+)
+
+indicator_values[1,]=c("test","test","test")
+
+for (s in sectors){
+  for(m in metrics){
+    test_value <- filter(indicator_lines, sector==s & metric==m) %>% pull(post_pre)
+    comp_values <- filter(events_plot, sector==s & metric==m) %>% 
+      pull(post_pre) 
+    
+    # temp <- t.test(mu=test_value,
+    #               x=comp_values, 
+    #               alternative="greater")
+    # 
+    # p<- round(temp$p.value,digits=4)
+    
+    p <- round(mean(test_value >= comp_values), digits=3)
+    
+    indicator_values <-indicator_values %>%
+      rbind(c(s,m,paste0("p=",p)))
+  }
+}
+
+
+hist <- ggplot()+
+  geom_histogram(
+    data=filter(events_plot, sector!='restaurant'),
+    aes(x=post_pre),
+    bins=40,
+    position='identity',
+    fill="lightblue"
+  )+
+  geom_vline(data=indicator_lines,
+             mapping=aes(xintercept=post_pre),
+             linetype='dotted',color='black')+
+  facet_grid(metric~sector,
+         scales='free')+
+  labs(title="Event Study Distribution",
+       x="Normalized Post Pre Diff",
+       y="Frequency (Count)") +
+  theme_classic()+
+  theme(strip.background = element_blank())
+
+ggsave("event_hist.png", height=6, width = 8)
+```
+
+## Other Figures for Memorandum and Appendix
+```{r restaurant plot over time - Figure 1}
+scc_restaurants <- santa_clara_data %>%
+  filter(sector=="restaurant") %>%
+  mutate(year=year(date),
+         week = date %>% strftime("%V"),
+         year_label= date %>% strftime("%g"),
+         combo=paste0(week,year_label)) %>%
+  group_by(week,year_label) %>%
+  summarise(avg_weekly_visit=mean(daily_visits),
+            avg_dwell=mean(median_dwell),
+            median_dwell=median(median_dwell)) %>%
+  filter(year_label %in% c("19","20"))
+
+month_labels <- c("Mar", "Jun", "Sep", "Dec")
+
+restaurant_plot_time<- ggplot(scc_restaurants,aes(x=week, y=median_dwell,group=year_label)) +
+        geom_line(aes(color=year_label), show.legend = FALSE) +
+        scale_x_discrete(breaks = c(10, 23, 36, 49),expand=c(0, 1), labels=month_labels) + 
+        labs(x="",y="Median dwell time at restaurants") +
+        geom_vline(xintercept = 11, linetype="dotted", 
+                  color = "black", size=1) +
+        geom_text(mapping=aes(x=11, y=1, label="Stay at home order"), size=3.5, family="Helvetica", angle=90, vjust=-0.8, hjust=0, check_overlap = TRUE) +
+        scale_color_manual(values = c("20" = "#E10077", "19" = "#559B06")) +
+        #scale_color_aaas() +
+        theme_classic() +
+        theme(axis.title.x = element_blank()) +
+        expand_limits(x = 58)+
+        annotate("text",
+                 x=55,
+                 y=15,
+                 label="2020",
+                 color="#E10077")+
+        annotate("text",
+                 x=55,
+                 y=29,
+                 label="2019",
+                 color="#559B06")
+
+ggsave("restaurants_time.png",height=3, width=6)
+
+restaurant_plot_visits <- ggplot(scc_restaurants,aes(x=week, y=avg_weekly_visit,group=year_label)) +
+        geom_line(aes(color=year_label), show.legend = FALSE) +
+        scale_x_discrete(breaks = c(10, 23, 36, 49),expand=c(0, 1), labels=month_labels) + 
+        labs(x="",y="Average weekly visits at restaurants") +
+        geom_vline(xintercept = 11, linetype="dotted", 
+                  color = "black", size=1) +
+        geom_text(mapping=aes(x=11, y=1, label="Stay at home order"), size=3.5, family="Helvetica", angle=90, vjust=-0.8, hjust=0, check_overlap = TRUE) +
+        scale_color_manual(values = c("20" = "#E10077", "19" = "#559B06")) +
+        #scale_color_aaas() +
+        theme_classic() +
+        theme(axis.title.x = element_blank()) +
+        expand_limits(x = 58)+
+        annotate("text",
+                 x=55,
+                 y=100,
+                 label="2020",
+                 color="#E10077")+
+        annotate("text",
+                 x=55,
+                 y=150,
+                 label="2019",
+                 color="#559B06")
+
+ggsave("restaurants_visits.png",height=3, width=6)
+
+```

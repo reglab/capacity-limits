@@ -1,0 +1,1030 @@
+---
+title: "Capacity Paper Figures"
+author: "RegLab"
+date: "3/7/2021"
+output: html_document
+---
+
+
+## Setup imports
+```{r, warning=FALSE}
+# Imports
+library(tidyverse)
+library(lubridate)
+library(cowplot)
+library(msir)
+```
+
+
+## Source capacity paper variables
+```{r}
+source("scripts/capacity_paper_variables-backfill.R")
+```
+
+
+# Place stats
+
+```{r}
+readRDS(paste0(data_path, "scc_places_df.rds")) %>% 
+  group_by(type) %>% 
+  summarize(n())
+```
+
+
+# Occupancy Ratio Plots
+
+## Load 2019 and 2020 data
+```{r}
+scc_preprocessed_2019_df <- 
+  readRDS(
+    paste0(data_path, "scc_preprocessed_2019_df.rds")
+  )
+
+scc_preprocessed_2020_df <- 
+  readRDS(
+    paste0(data_path, "scc_preprocessed_2020_df.rds")
+  )
+```
+
+
+## Filter dates and sectors and bind dataframes.
+```{r}
+scc_hourly_post_2019_df <-  
+  scc_preprocessed_2019_df %>% 
+  filter(
+    date >= ymd(post_2019_start_date) 
+    & date <= ymd(post_2019_end_date)
+  ) %>% 
+  mutate(
+    date_bin = paste0(post_2019_start_date, " to ", post_2019_end_date),
+    period = "After",
+    year = 2019
+  )
+
+scc_hourly_post_2020_df <-  
+  scc_preprocessed_2020_df %>% 
+  filter(
+    date >= ymd(post_2020_start_date) 
+    & date <= ymd(post_2020_end_date)
+  ) %>% 
+  mutate(
+    date_bin = paste0(post_2020_start_date, " to ", post_2020_end_date),
+    period = "After",
+    year = 2020
+  )
+
+scc_hourly_pre_2019_df <-  
+  scc_preprocessed_2019_df %>% 
+  filter(
+    date >= ymd(pre_2019_start_date) 
+    & date <= ymd(pre_2019_end_date)
+  ) %>% 
+  mutate(
+    date_bin = paste0(pre_2019_start_date, " to ", pre_2019_end_date),
+    period = "Before",
+    year = 2019
+  )
+
+scc_hourly_pre_2020_df <-  
+  scc_preprocessed_2020_df %>% 
+  filter(
+    date >= ymd(pre_2020_start_date) 
+    & date <= ymd(pre_2020_end_date)
+  ) %>% 
+  mutate(
+    date_bin = paste0(pre_2020_start_date, " to ", pre_2020_end_date),
+    period = "Before",
+    year = 2020
+  )
+
+scc_hourly_df <- 
+  rbind(
+    scc_hourly_pre_2019_df,
+    scc_hourly_post_2019_df,
+    scc_hourly_pre_2020_df,
+    scc_hourly_post_2020_df
+  )
+
+scc_hourly_df <- 
+  scc_hourly_df %>% 
+  select(-sector) %>% 
+  rename(sector = type)
+
+scc_hourly_df$period_f <- 
+  factor(
+    scc_hourly_df$period, 
+    levels = c('Before', 'After'),
+    labels = c('Before Dec. 6', 'After Dec. 7')
+  )
+```
+
+
+## Filter open hours and occupancy ratios outside of (0, 1) and religious organizations
+```{r}
+scc_hourly_clean_df <- 
+  scc_hourly_df %>% 
+  filter(is_open & occupancy_ratio > 0 & occupancy_ratio <= 1)
+
+scc_hourly_clean_df$sector <- 
+  factor(
+    scc_hourly_clean_df$sector,
+    levels = sector_factor_levels,
+    labels = sector_factor_labels
+  )
+```
+
+
+## Compute sector statistics for hours with occupancy above threshold
+```{r}
+over_threshold_labels <- 
+  scc_hourly_clean_df %>% 
+  mutate(
+    over_threshold_20 = occupancy_ratio > 0.2,
+  ) %>% 
+  group_by(sector, date_bin, period_f, year) %>% 
+  summarize(
+    count_over_20 = sum(over_threshold_20),
+    count_total = n()
+  ) %>% 
+  mutate(
+    percent_over_20 = count_over_20 / count_total * 100
+  ) %>% 
+  select(
+    sector, 
+    date_bin,
+    period_f,
+    year,
+    percent_over_20,
+    count_total,
+  ) %>% 
+  left_join(
+    data.frame(
+      sector = factor(
+        c("big_box", "grocery", "pharmacy"),
+        levels = sector_factor_levels,
+        labels = sector_factor_labels
+      ),
+      y_low  = c(2250, 5000, 2500)
+    ),
+    by = "sector"
+  ) %>% 
+  unite("period_sector", period_f, sector, remove = FALSE)
+
+over_threshold_labels
+```
+
+
+## Plot histogram of occupancy ratio per hour
+```{r}
+mean(scc_hourly_clean_df$occupancy_ratio > 0.3)
+
+or_hist_df <-
+  scc_hourly_clean_df %>% 
+  filter(occupancy_ratio <= 0.3) %>% 
+  unite("period_sector", period_f, sector, remove = FALSE)
+
+unique(or_hist_df$period_sector)
+```
+
+
+```{r}
+GeomStepHist <- ggproto("GeomStepHist", GeomPath,
+                        required_aes = c("x"),
+
+                        draw_panel = function(data, panel_scales, coord, direction) {
+                          data <- as.data.frame(data)[order(data$x), ]
+
+                          n <- nrow(data)
+                          i <- rep(1:n, each=2)
+                          newdata <- rbind(
+                            transform(data[1, ], x=x - width/2, y=0),
+                            transform(data[i, ], x=c(rbind(data$x-data$width/2, data$x+data$width/2))),
+                            transform(data[n, ], x=x + width/2, y=0)
+                          )
+                          rownames(newdata) <- NULL
+
+                          GeomPath$draw_panel(newdata, panel_scales, coord)
+                        }
+)
+
+
+geom_step_hist <- function(mapping = NULL, data = NULL, stat = "bin",
+                           direction = "hv", position = "stack", na.rm = FALSE, 
+                           show.legend = NA, inherit.aes = TRUE, ...) {
+  layer(
+    data = data,
+    mapping = mapping,
+    stat = stat,
+    geom = GeomStepHist,
+    position = position,
+    show.legend = show.legend,
+    inherit.aes = inherit.aes,
+    params = list(
+      direction = direction,
+      na.rm = na.rm,
+      ...
+    )
+  )
+}
+```
+
+
+
+```{r}
+hist_period_labels <- data.frame(
+  period_f = rep(c("Before Dec. 6", "After Dec. 7"), 3),
+  year = rep("2019", 6),
+  x = rep(c(0.025, 0.035), 3),
+  y = c(9000, 5500, 9000, 5000, 20500, 10000),
+  sector = c("big_box", "big_box", "pharmacy", "pharmacy", "grocery", "grocery"),
+  period_sector = c("Before Dec. 6_General Merchandise Stores", "After Dec. 7_General Merchandise Stores", "Before Dec. 6_Pharmacies", "After Dec. 7_Pharmacies", "Before Dec. 6_Grocery Stores", "After Dec. 7_Grocery Stores")
+)
+
+hist_period_labels$sector <- 
+  factor(
+    hist_period_labels$sector,
+    levels = sector_factor_levels,
+    labels = sector_factor_labels
+  )
+
+occupancy_ratio_hist <- 
+  ggplot() +
+    geom_histogram(
+      data = or_hist_df %>% filter(period_f == "Before Dec. 6"),
+      aes(x = occupancy_ratio, y = ..count.., fill = period_sector),
+      bins = 40,
+      position = "identity"
+    ) +
+    geom_step_hist(
+      data = or_hist_df %>% filter(period_f == "After Dec. 7"),
+      aes(x = occupancy_ratio, y = ..count.., color = period_sector),
+      bins = 40, 
+      position = "identity"
+    ) +
+    geom_vline(xintercept = 0.2, linetype = "dashed", color = "#212121") +
+    geom_text(
+      data = hist_period_labels,
+      mapping = aes(x = x, y = y, label = period_f, color = period_sector, hjust = 0),
+      size = 3
+    ) +
+    xlab("Fraction of maximum occupancy") + 
+    ylab("Hours") +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 2), labels = scales::comma) +
+    facet_grid(
+      sector ~ year, 
+      scale = "free_y",
+      labeller = labeller(sector = label_wrap_gen(15))
+    ) + 
+    theme_classic() +
+    theme(
+      legend.position = "none",
+      #strip.text.y = element_text(angle = 0),
+      strip.text.y = element_blank(),
+      strip.background = element_blank()
+    ) +
+    scale_fill_manual(values = sector_period_colors) +
+    scale_color_manual(values = sector_period_colors)
+
+occupancy_ratio_hist
+```
+
+
+```{r}
+hours_period_labels <- data.frame(
+  period_f = rep(c("Before Dec. 6", "After Dec. 7"), 3),
+  x = c(2019.25, 2019, 2019, 2019.25, 2019, 2019.25),
+  y = c(44500, 41000, 42000, 50500, 82000, 97000),
+  sector = c("General Merchandise Stores", "General Merchandise Stores", "Pharmacies", "Pharmacies", "Grocery Stores", "Grocery Stores"),
+  period_sector = c("Before Dec. 6_General Merchandise Stores", "After Dec. 7_General Merchandise Stores", "Before Dec. 6_Pharmacies", "After Dec. 7_Pharmacies", "Before Dec. 6_Grocery Stores", "After Dec. 7_Grocery Stores")
+)
+
+hours_plot <- 
+  over_threshold_labels %>% 
+  ggplot() +
+    geom_line(aes(x = year, y = count_total, color = period_sector)) +
+    geom_point(aes(x = year, y = count_total, color = period_sector)) +
+    geom_text(
+      data = hours_period_labels,
+      mapping = aes(x = x, y = y, label = period_f, color = period_sector, hjust = 0),
+      size = 3
+    ) +
+    xlab("Year") + 
+    ylab("Nonzero occupancy hours") +
+    scale_x_continuous(breaks = c(2019, 2020)) +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 2), labels = scales::comma) +
+    facet_grid(
+      rows = vars(sector), 
+      scale = "free_y",
+      labeller = labeller(sector = label_wrap_gen(15)) 
+    ) + 
+    theme_classic() +
+    theme(
+      legend.position = "none",
+      strip.text.y = element_text(angle = 0),
+      #strip.text.y = element_blank(),
+      strip.background = element_blank()
+    ) +
+    scale_color_manual(values = sector_period_colors)
+
+hours_plot
+```
+
+
+```{r}
+ggsave(
+  paste0(
+    repo_path, "figures/", "figure_4.png"
+  ),
+  plot = plot_grid(
+    occupancy_ratio_hist, 
+    hours_plot, 
+    labels = "auto",
+    nrow = 1,
+    rel_widths = c(2, 1.25)
+  ),
+  height = 3,
+  width = 8
+)
+```
+
+
+# Hourly distribution appendix figure
+
+```{r}
+or_hist_df <- scc_hourly_df
+
+or_hist_df$sector <-
+  factor(
+    or_hist_df$sector,
+    levels = sector_factor_levels,
+    labels = sector_factor_labels
+  )
+
+or_hist_df <- 
+  or_hist_df %>% 
+  group_by(
+    year,
+    sector,
+    hour,
+    period_f,
+  ) %>%
+  summarize(avg_hourly_visits=mean(hourly_visits_smeared)) %>% 
+  unite("period_sector",period_f,sector, remove=FALSE) 
+
+hist_period_labels <- data.frame(
+  period_f = rep(c("Before Dec. 6", "After Dec. 7"), 3),
+  x = rep(c(1, 6), 3),
+  y = c(120,140,18,21,17,20),
+  year = rep("2019", 6),
+  sector = c("big_box", "big_box", "pharmacy", "pharmacy", "grocery", "grocery"),
+  period_sector = c("Before Dec. 6_General Merchandise Stores", "After Dec. 7_General Merchandise Stores", "Before Dec. 6_Pharmacies", "After Dec. 7_Pharmacies", "Before Dec. 6_Grocery Stores", "After Dec. 7_Grocery Stores")
+)
+
+hist_period_labels$sector <- 
+  factor(
+    hist_period_labels$sector,
+    levels = sector_factor_levels,
+    labels = sector_factor_labels
+  )
+
+hourly_visits_plot <- 
+  ggplot() +
+    geom_bar(
+      data = or_hist_df %>% filter(period_f == "Before Dec. 6"),
+      aes(x = hour, y = avg_hourly_visits, fill = period_sector), stat="identity"
+    ) +
+    geom_bar(
+      data = or_hist_df %>% filter(period_f == "After Dec. 7"),
+      aes(x = hour, y = avg_hourly_visits, color = period_sector, fill=NA), 
+      stat="identity"
+    ) +
+    geom_text(
+      data = hist_period_labels,
+      mapping = aes(x = x, y = y, label = period_f, color = period_sector, hjust = 0),
+      size = 3
+    ) +
+    xlab("Hour of the Day") + 
+    ylab("Average Hourly Visits") +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 3), labels = scales::comma) +
+    facet_grid(
+      sector ~ year, 
+      scale = "free_y",
+      labeller = labeller(sector = label_wrap_gen(15))
+    ) + 
+    theme_classic() +
+    theme(
+      legend.position = "none",
+      strip.text.y = element_text(angle = 0),
+      #strip.text.y = element_blank(),
+      strip.background = element_blank()
+    ) +
+    scale_fill_manual(values = sector_period_colors) +
+    scale_color_manual(values = sector_period_colors)
+
+hourly_visits_plot
+
+ggsave(
+  paste0(
+    repo_path, "figures/", "hourly_visits.png"
+  ), 
+  hourly_visits_plot, 
+  width=7.5, 
+  height=6
+)
+```
+
+
+
+# Academic vs SCC capacity limit comparison
+
+## Load capacity limit data
+```{r}
+scc_capacity_limit_df <- 
+  readRDS(
+    paste0(data_path, "scc_capacity_limit_df.rds")
+)
+
+scc_capacity_limit_df <- 
+  scc_capacity_limit_df %>%
+  rename(sector = type) 
+
+scc_capacity_limit_df$sector <- 
+  factor(
+    scc_capacity_limit_df$sector,
+    levels = sector_factor_levels,
+    labels = sector_factor_labels
+  )
+```
+
+
+## Create capacity limit table
+```{r}
+se <- function(x) sqrt(var(x)/length(x))
+
+diff <- 
+  scc_capacity_limit_df %>% 
+  group_by(sector) %>% 
+  filter(scc_capacity_limit > 0 & academic_capacity_limit > 0) %>% 
+  summarize(
+    mean_abs = mean(scc_capacity_limit - academic_capacity_limit),
+    se_abs = se(scc_capacity_limit - academic_capacity_limit),
+    mean_rel = mean((scc_capacity_limit - academic_capacity_limit) / academic_capacity_limit),
+    se_rel = se((scc_capacity_limit - academic_capacity_limit) / academic_capacity_limit)
+  )
+
+diff
+```
+
+
+## Compute summary statistics for paper
+```{r}
+sum(scc_capacity_limit_df$scc_capacity_limit > 
+    scc_capacity_limit_df$academic_capacity_limit) / nrow(scc_capacity_limit_df)
+```
+
+
+```{r}
+scc_capacity_limit_df %>% 
+  group_by(sector) %>% 
+  summarize(num = n()) %>% 
+  inner_join(diff) %>% 
+  weighted.mean(x = .$mean_rel, w = .$num)
+
+# Percent of capacity limit for academic to match policy on average
+1 / (scc_capacity_limit_df %>% 
+  group_by(sector) %>% 
+  summarize(num = n()) %>% 
+  inner_join(diff) %>% 
+  weighted.mean(x = .$mean_rel, w = .$num) + 1) * .2
+```
+
+
+## Create capacity limit scatterplot
+```{r}
+capacity_limit_hist <- 
+  scc_capacity_limit_df %>% 
+  ggplot(aes(x = academic_capacity_limit, y = scc_capacity_limit, color= sector)) +
+    geom_point(alpha=0.8) +
+    geom_abline(slope=1, intercept=0, linetype = "dashed", color = "#212121") +
+    xlim(c(0, 675)) +
+    ylim(c(0, 675)) +
+    coord_fixed() +
+    annotate(
+      "text", x = 235, y = 225, 
+      label = "Grocery Stores", 
+      color = sector_colors["Grocery Stores"]
+    ) +
+    annotate(
+      "text", x = 110, y = 290, 
+      label = "Pharmacies", 
+      color = sector_colors["Pharmacies"]
+    ) +
+    annotate(
+      "text", x = 415, y = 650, 
+      label = "General Merchandise\nStores", 
+      color = sector_colors["General Merchandise Stores"]
+    ) +
+    xlab("Academic capacity limit (persons)") + 
+    ylab("CA policy capacity limit (persons)") +
+    theme_classic() +
+    theme(
+      aspect.ratio = 1,
+      legend.position = "none"
+    ) +
+    scale_color_manual(values = sector_colors)
+
+capacity_limit_hist
+
+ggsave(
+  paste0(
+    repo_path, "figures/", "capacity_limit_scatterplot.pdf"
+  ),
+  plot = capacity_limit_hist,
+  height = 3,
+  width = 3
+)
+```
+
+
+# Open Hours Histogram
+
+## Load open hours data
+```{r}
+scc_sector_hourly_open_df <- readRDS(
+  paste0(data_path, "scc_sector_hourly_open_df.rds")
+)
+
+scc_sector_hourly_open_df <- 
+  scc_sector_hourly_open_df %>%
+  rename(sector = type) %>% 
+  filter(sector != "religious")
+
+scc_sector_hourly_open_df$sector <- 
+  factor(
+    scc_sector_hourly_open_df$sector,
+    levels = sector_factor_levels,
+    labels = sector_factor_labels
+  )
+```
+
+
+## Create open hour histogram
+```{r}
+open_hours_hist <- 
+  scc_sector_hourly_open_df %>%  
+  group_by(hour, sector) %>% 
+  summarize(median_frac_open = quantile(frac_open, 0.5, rm.na = FALSE)) %>% 
+  ggplot(., aes(x=hour, fill = sector)) +
+    geom_bar(
+      aes(y = median_frac_open), 
+      #color = "#212121",
+      stat = "identity", 
+      position = position_dodge()
+    ) +
+    geom_hline(yintercept = 0.5, linetype ="dashed", color = "#212121") +
+    annotate("text", x = 2.5, y = 0.1, label = "Grocery Stores", color = sector_colors["Grocery Stores"]) +
+    annotate("text", x = 8.5, y = 0.95, label = "Pharmacies", color = sector_colors["Pharmacies"]) +
+    annotate("text", x = 20, y = 1.03, label = "General Merchandise Stores", color = sector_colors["General Merchandise Stores"]) +
+    scale_x_continuous(breaks = c(1, 5, 9, 13, 17, 21)) +
+    ylab("Median fraction of stores open") +
+    xlab("Hour") +
+    theme_classic() +
+    theme(legend.position = "none") +
+    scale_fill_manual(values = sector_colors)
+
+open_hours_hist
+
+ggsave(
+  paste0(
+    repo_path, "figures/", "open_hours_hist.png"
+  ),
+  plot = open_hours_hist,
+  height = 3.71,
+  width = 6
+)
+```
+
+
+# Assessor and Safegraph Square Footage Comparison  
+
+## Load Safegraph and Assesor square footage data
+```{r}
+scc_parcels_df <- readRDS(
+  paste0(repo_path, "data/scc_parcels_all_placekey.rds")
+)
+
+scc_places_df <- readRDS(
+  paste0(repo_path, output_data_dir, "scc_places_df.rds")
+)
+
+scc_sqft_df <- 
+  inner_join(
+    scc_places_df %>% 
+      mutate(
+        placekey = paste0(substring(placekey, 1, 3), substring(placekey, 8))
+      ),
+    scc_parcels_df,
+    by = "placekey"
+  ) %>% 
+  transmute(
+    safegraph_place_id = safegraph_place_id,
+    sector = type,
+    safegraph_sq_ft = area_square_feet,
+    assessor_sq_ft = SQ_FT,
+    location_name = location_name,
+    street_address = street_address,
+    city = city,
+    STREET_NUM = STREET_NUM,
+    ADDR = ADDR,
+    CITY = CITY
+  ) 
+
+scc_sqft_df$sector <- 
+  factor(
+    scc_sqft_df$sector,
+    levels = sector_factor_levels,
+    labels = sector_factor_labels
+  )
+
+scc_sqft_df %>% 
+  group_by(sector) %>% 
+  summarize(n())
+```
+
+
+## Create scatterplot of square footage reported by both sources
+```{r}
+sqft_scatterplot <- 
+  scc_sqft_df %>% 
+  filter(sector != "religious") %>% 
+  ggplot(aes(x = safegraph_sq_ft, y = assessor_sq_ft, color = sector)) +
+    geom_point(alpha= 0.8) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#212121") +
+    annotate("text", x = 36000, y = 98000, label = "Grocery Stores", color = sector_colors["Grocery Stores"]) +
+    annotate("text", x = 50000, y = 130954, label = "Pharmacies", color = sector_colors["Pharmacies"]) +
+    annotate("text", x = 140257, y = 52800, label = "General Merchandise Stores", color = sector_colors["General Merchandise Stores"]) +
+    xlim(0, 200000) +
+    ylim(0, 200000) +
+    ylab(bquote("SCC Assessor area" ~ (ft^2))) +
+    xlab(bquote("Safegraph area" ~ (ft^2))) +
+    theme_classic() +
+    theme(aspect.ratio = 1) +
+    theme(legend.position = "none") +
+    scale_color_manual(values = sector_colors)
+
+sqft_scatterplot
+
+ggsave(
+  paste0(
+    repo_path, "figures/", "sqft_scatterplot.png"
+  ),
+  plot = sqft_scatterplot,
+  height = 4,
+  width = 4
+)
+```
+
+
+# Mobility case correlation plots
+
+## Load dataframes
+```{r}
+lagged_analysis_data_df <-   
+  readRDS(paste0(repo_path, data_dir, "lagged_analysis_data_df.rds"))
+
+lagged_analysis_data_df$county <- 
+  factor(
+    lagged_analysis_data_df$county,
+    levels = county_factor_levels
+  )
+
+correlations_df <- 
+  readRDS(paste0(repo_path, data_dir, "correlations_df.rds"))
+
+correlations_df$county <- 
+  factor(
+    correlations_df$county,
+    levels = county_factor_levels
+  )
+```
+
+
+```{r}
+mobility_ratio_plot <- 
+  lagged_analysis_data_df %>% 
+  ungroup() %>% 
+  select(county, date, mobility_dwell_ratio, mean_dwell_ratio_7) %>% 
+  mutate(unlag_date = date - 11) %>% 
+  ggplot(aes(color = county)) +
+    geom_point(aes(x = unlag_date, y = mobility_dwell_ratio), size = 0.25) +
+    geom_line(aes(x = unlag_date, y = mean_dwell_ratio_7)) +
+    xlab("Date") +
+    ylab("Mobility ratio") +
+    theme_classic() +
+    theme(legend.position = "bottom") +
+    theme(legend.title = element_text(size = 8), legend.text = element_text(size = 8)) +
+    scale_color_manual("County", values = county_colors)
+
+mobility_ratio_plot
+
+ggsave(
+  paste0(
+    repo_path, "figures/", "mobility_ratio.png"
+  ),
+  plot = mobility_ratio_plot,
+  height = 3.71,
+  width = 6
+)
+```
+
+
+```{r}
+lagged_weekday_data_df <-
+  lagged_analysis_data_df %>% 
+  ungroup() %>% 
+  select(county, date, mobility_dwell_ratio, mean_dwell_ratio_7) %>% 
+  mutate(
+    unlag_date = date - 11,
+    weekday = (as.integer(format(unlag_date, "%w")) + 6) %% 7,
+    week = unlag_date - weekday
+  ) %>% select(
+    county,
+    weekday,
+    mobility_dwell_ratio,
+    week
+  )
+
+mobility_weekday_df <-
+  lagged_weekday_data_df %>% 
+  filter(weekday <= 4) %>% 
+  group_by(county, week) %>% 
+  summarize(mean_mobility = mean(mobility_dwell_ratio)) %>% 
+  ungroup()
+
+mobility_weekend_df <-
+  lagged_weekday_data_df %>% 
+  filter(weekday >= 5) %>% 
+  group_by(county, week) %>% 
+  summarize(mean_mobility = mean(mobility_dwell_ratio)) %>% 
+  ungroup()
+
+min_exp = min(
+  mobility_weekend_df$mean_mobility, 
+  mobility_weekday_df$mean_mobility
+) - 0.01
+max_exp = max(
+  mobility_weekend_df$mean_mobility, 
+  mobility_weekday_df$mean_mobility
+) + 0.01
+```
+
+
+```{r}
+mobility_ratio_weekday_plot <- 
+  mobility_weekday_df %>% 
+  ggplot(aes(color = county)) +
+    geom_point(aes(x = week, y = mean_mobility), size = 0.5) +
+    geom_line(aes(x = week, y = mean_mobility)) +
+    xlab("Week") +
+    ylab("Average mobility ratio\n (weekdays)") +
+    theme_classic() +
+    theme(legend.position = "bottom") +
+    theme(legend.title = element_text(size = 8), legend.text = element_text(size = 8)) +
+    scale_color_manual("County", values = county_colors) +
+    ylim(min_exp, max_exp) 
+
+mobility_ratio_weekday_plot
+```
+
+
+```{r}
+mobility_ratio_weekend_plot <- 
+  mobility_weekend_df %>% 
+  ggplot(aes(color = county)) +
+    geom_point(aes(x = week, y = mean_mobility), size = 0.5) +
+    geom_line(aes(x = week, y = mean_mobility)) +
+    xlab("Week") +
+    ylab("Average mobility ratio\n (weekends)") +
+    theme_classic() +
+    theme(legend.position = "bottom") +
+    theme(legend.title = element_text(size = 8), legend.text = element_text(size = 8)) +
+    scale_color_manual("County", values = county_colors) +
+    ylim(min_exp, max_exp) 
+
+mobility_ratio_weekend_plot
+```
+
+
+```{r}
+legend = get_legend(mobility_ratio_weekday_plot)
+
+prow <- plot_grid(
+  mobility_ratio_weekday_plot + theme(legend.position = "none"), 
+  mobility_ratio_weekend_plot + theme(legend.position = "none"), 
+  labels = c('a', 'b')
+)
+
+mobility_week_days_ends_plot <- 
+  plot_grid(prow, legend, ncol = 1, rel_heights = c(1, .2))
+
+mobility_week_days_ends_plot
+
+ggsave(
+  paste0(
+    repo_path, "figures/", "mobility_ratio_week_days_ends.png"
+  ),
+  plot = mobility_week_days_ends_plot,
+  height = 3,
+  width = 6.5
+)
+```
+
+
+
+```{r}
+case_growth_plot <- 
+  lagged_analysis_data_df %>% 
+  ggplot(aes(color = county)) +
+    geom_point(aes(x = date, y = case_growth_alt), size = 0.5) +
+    geom_smooth(aes(x = date, y = case_growth_alt), size = 0.5, span = 0.4, se = FALSE) +
+    geom_hline(yintercept = 1, linetype="dashed", color = "#212121") + 
+    ylim(0.75, 1.6) +
+    xlab("Date") +
+    ylab("Case growth ratio") +
+    theme_classic() +
+    theme(legend.position = "bottom") +
+    theme(legend.title = element_text(size = 8), legend.text = element_text(size = 8)) +
+    scale_color_manual("County", values = county_colors)
+
+case_growth_plot
+
+ggsave(
+  paste0(
+    repo_path, "figures/", "case_growth.png"
+  ),
+  plot = case_growth_plot,
+  height = 3.71,
+  width = 6
+)
+```
+
+
+```{r}
+county_loess_df <- NULL
+
+for (curr_county in county_factor_levels) {
+  curr_loess <- 
+    correlations_df %>% 
+    ungroup() %>% 
+    filter(!is.na(dwell_corr_alt) & county == curr_county) %>% 
+    loess.sd(
+      x = .$date, 
+      y = .$dwell_corr_alt,
+      nsigma = 0.67,
+      span = 0.5
+    )
+  
+  curr_loess_df <- 
+    data.frame(
+      county = curr_county,
+      x = zoo::as.Date(curr_loess$x),
+      y = curr_loess$y, 
+      lower = curr_loess$lower,
+      upper = curr_loess$upper
+    )
+  
+  county_loess_df <- rbind(county_loess_df, curr_loess_df)
+}
+```
+
+
+```{r}
+science_label_text <- data.frame(
+  label = "Published\nscience", county = "Alameda", x = ymd("2020-04-21"), y = -0.825
+)
+
+county_correlation_plot <- 
+  correlations_df %>%
+  filter(date >= ymd("2020-04-01")) %>% 
+  ungroup() %>% 
+  ggplot() +
+    geom_rect(
+      aes(xmin = ymd("2020-04-07"), xmax = ymd("2020-05-07"), ymin = -Inf, ymax = Inf), 
+      fill = "#EEEEEE", alpha = 0.1
+    ) +
+    geom_point(
+      aes(x = date, y = dwell_corr_alt, color = county), 
+      size = 0.25,
+      alpha = 0.5
+    ) +
+    geom_ribbon(
+      data = county_loess_df,
+      aes(x = x, ymin = lower, ymax = upper, fill = county),
+      alpha = 0.4
+    ) +
+    geom_line(
+      data = county_loess_df,
+      aes(x = x, y = y),
+      color = "#FFFFFF",
+      size = 1
+    ) +
+    geom_hline(yintercept = 0.0, linetype = "dashed", color = "#212121") +
+    geom_text(data = science_label_text, aes(x = x, y = y, label = label), size = 3, color = "#212121") +
+    #annotate("text", x = ymd("2020-04-21"), y = -0.825, label = "Published\nscience", county = "Alameda", size = 3, color = "#212121") +
+    facet_wrap(~ county) + 
+    xlab("Date") +
+    ylab("Mobility-case growth correlation") +
+    theme_classic() +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.background = element_blank()
+    ) +
+    scale_color_manual("County", values = county_colors) +
+    scale_fill_manual("County", values = county_colors)
+
+county_correlation_plot
+
+ggsave(
+  paste0(
+    repo_path, "figures/", "smooth_correlation_county.png"
+  ),
+  plot = county_correlation_plot,
+  height = 4.94,
+  width = 8
+)
+```
+
+
+```{r}
+mean_loess <- 
+  correlations_df %>% 
+  ungroup() %>% 
+  filter(!is.na(dwell_corr_alt)) %>% 
+  loess.sd(
+    x = .$date, 
+    y = .$dwell_corr_alt,
+    nsigma = 0.67,
+    span = 0.4
+  )
+
+mean_loess_df <- 
+  data.frame(
+    x = zoo::as.Date(mean_loess$x),
+    y = mean_loess$y, 
+    lower = mean_loess$lower,
+    upper = mean_loess$upper
+  )
+```
+
+
+```{r}
+overall_correlation_plot <- 
+  correlations_df %>%
+  filter(date >= ymd("2020-04-01")) %>% 
+  ungroup() %>% 
+  ggplot() +
+    geom_rect(
+      aes(xmin = ymd("2020-04-07"), xmax = ymd("2020-05-07"), ymin = -Inf, ymax = Inf), 
+      fill = "#EEEEEE", alpha = 0.1
+    ) +
+    geom_point(
+      aes(x = date, y = dwell_corr_alt, color = county), 
+      size = 0.25,
+      alpha = 0.5
+    ) +
+    geom_ribbon(
+      data = mean_loess_df,
+      aes(x = x, ymin = lower, ymax = upper),
+      fill = "#d6566b", alpha = 0.4
+    ) +
+    geom_line(
+      data = mean_loess_df,
+      aes(x = x, y = y),
+      color = "#FFFFFF",
+      size = 1
+    ) +
+    geom_hline(yintercept = 0.0, linetype = "dashed", color = "#212121") +
+    xlab("Date") +
+    ylab("Mobility-case growth correlation") +
+    theme_classic() +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_text(size = 8), 
+      legend.text = element_text(size = 8)  
+    ) +
+    scale_color_manual("County", values = county_colors) +
+    annotate("text", x = ymd("2020-04-21"), y = -0.825, label = "Published\nscience", size = 3, color = "#212121")
+
+overall_correlation_plot
+
+ggsave(
+  paste0(
+    repo_path, "figures/", "overall_correlation.pdf"
+  ),
+  plot = overall_correlation_plot,
+  height = 3.71,
+  width = 6
+)
+```
+

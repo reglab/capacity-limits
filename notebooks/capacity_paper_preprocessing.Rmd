@@ -1,0 +1,602 @@
+---
+title: "Capacity Paper Preprocessing"
+author: "RegLab"
+date: "3/7/2021"
+output: html_document
+---
+
+## Setup imports
+```{r, warning=FALSE}
+# Imports
+library(tidyverse)
+library(lubridate)
+library(jsonlite)
+library(slider)
+```
+
+
+## Source capacity paper functions and variables
+```{r}
+source("scripts/capacity_paper_variables-backfill.R")
+source("scripts/capacity_paper_functions-backfill.R")
+```
+
+
+# Preprocess SCC Places
+
+## Load SafeGraph Core Places and square footage data
+```{r}
+sg_core_ca_df <- 
+  readRDS(
+    paste0(root_path, sg_poi_ca_dir, "core_poi-ca.rds")
+  ) %>% 
+  select(
+    -c(
+      "parent_safegraph_place_id", 
+      "safegraph_brand_ids",
+      "phone_number",
+      "category_tags",
+      "opened_on",
+      "closed_on",
+      "tracking_opened_since",
+      "tracking_closed_since"
+      )
+    )
+  
+sg_sqft_df <- 
+  readRDS(
+    paste0(root_path, sg_poi_ca_dir, "may-june-august-sqft.rds")
+  )
+
+sector_ca_df <- filter_sector_df(sg_core_ca_df)
+```
+
+
+## Filter in scope place ids (does not need to be re-run frequently)
+```{r}
+in_scope_daily_df <- readRDS(
+  paste0(data_path, "daily-patterns-bay/Santa Clara-daily-patterns-backfill.rds")
+)
+
+in_scope_place_ids <- 
+  in_scope_daily_df %>% 
+  filter(sector != "restaurant") %>% 
+  .$safegraph_place_id %>% 
+  unique()
+
+saveRDS(
+  in_scope_place_ids,
+  paste0(data_path, "in_scope_place_ids.rds")
+)
+
+remove(in_scope_daily_df)
+```
+
+
+## Filter to in scope SCC places
+```{r}
+in_scope_place_ids <- 
+  readRDS(
+    paste0(data_path, "in_scope_place_ids.rds")
+  )
+
+scc_places_df <- 
+  sector_ca_df %>% 
+  filter(safegraph_place_id %in% in_scope_place_ids) %>% 
+  left_join(
+    sg_sqft_df %>% 
+      select(-c("location_name", "polygon_class", "iso_country_code")) %>% 
+      filter(safegraph_place_id %in% in_scope_place_ids),
+    by = "safegraph_place_id"
+  )
+
+saveRDS(
+  scc_places_df,
+  paste0(data_path, "scc_places_df.rds")
+)
+```
+
+
+## Explode open hours for SCC places
+```{r}
+scc_places_df %>% 
+  filter(is.na(.$open_hours)) %>% 
+  group_by(type) %>% 
+  summarize(count=n())
+
+scc_places_hourly_open_raw_df <- explode_open_hours(scc_places_df)
+
+saveRDS(
+  scc_places_hourly_open_raw_df,
+  paste0(data_path, "scc_places_hourly_open_raw_df.rds")
+)
+```
+
+
+## Determine average sector open hours for imputation
+```{r}
+scc_sector_hourly_open_df <- get_sector_open_hours(scc_places_hourly_open_raw_df, scc_places_df)
+
+saveRDS(
+  scc_sector_hourly_open_df,
+  paste0(data_path, "scc_sector_hourly_open_df.rds")
+)
+```
+
+
+## Impute missing place open hours
+```{r}
+scc_places_hourly_open_raw_df <- 
+  readRDS(
+    paste0(data_path, "scc_places_hourly_open_raw_df.rds")
+  )
+
+scc_sector_hourly_open_df <- 
+  readRDS(
+    paste0(data_path, "scc_sector_hourly_open_df.rds")
+  )
+
+scc_places_hourly_open_imputed_df <- 
+  impute_open_hours(
+    scc_places_hourly_open_raw_df, 
+    scc_sector_hourly_open_df, 
+    scc_places_df
+  )
+
+saveRDS(
+  scc_places_hourly_open_imputed_df,
+  paste0(data_path, "scc_places_hourly_open_imputed_df.rds")
+)
+```
+
+
+# Preprocess Hourly Visit Data
+
+## Load and join 2019 and 2020 hourly data
+```{r}
+scc_places_df <- 
+  readRDS(
+    paste0(data_path, "scc_places_df.rds")
+  )
+
+scc_places_hourly_open_imputed_df <- 
+  readRDS(
+    paste0(data_path, "scc_places_hourly_open_imputed_df.rds")
+  )
+
+scc_hourly_2019_df <- 
+  load_hourly_scc_df(get_2019_week_start_dates(), scc_places_df) %>% 
+  join_hourly_with_place_open(., scc_places_df, scc_places_hourly_open_imputed_df)
+
+scc_hourly_2020_df <- 
+  load_hourly_scc_df(get_2020_week_start_dates(), scc_places_df) %>% 
+  join_hourly_with_place_open(., scc_places_df, scc_places_hourly_open_imputed_df)
+
+scc_places_df %>% group_by(type) %>% summarize(n())
+```
+
+
+```{r}
+scc_hourly_2019_df %>% 
+  select(safegraph_place_id, type) %>% 
+  unique() %>% 
+  group_by(type) %>% 
+  summarize(n())
+
+scc_hourly_2020_df %>% 
+  select(safegraph_place_id, type) %>% 
+  unique() %>% 
+  group_by(type) %>% 
+  summarize(n())
+```
+
+
+## Filter 2019 and 2020 data to common POIs
+```{r}
+common_place_ids <- 
+  intersect(
+    scc_hourly_2019_df$safegraph_place_id, 
+    scc_hourly_2020_df$safegraph_place_id
+  )
+
+scc_hourly_common_2019_df <- 
+  scc_hourly_2019_df %>% filter(safegraph_place_id %in% common_place_ids)
+
+scc_hourly_common_2020_df <- 
+  scc_hourly_2020_df %>% filter(safegraph_place_id %in% common_place_ids)
+
+scc_hourly_common_2019_df %>% 
+  select(safegraph_place_id, type) %>% 
+  unique() %>% 
+  group_by(type) %>% 
+  summarize(n())
+
+scc_hourly_common_2020_df %>% 
+  select(safegraph_place_id, type) %>% 
+  unique() %>% 
+  group_by(type) %>% 
+  summarize(n())
+
+saveRDS(
+  scc_hourly_common_2019_df,
+  paste0(data_path, "scc_hourly_common_2019_df.rds")
+)
+
+saveRDS(
+  scc_hourly_common_2020_df,
+  paste0(data_path, "scc_hourly_common_2020_df.rds")
+)
+```
+
+## Smear 2019 and 2020 hourly data
+```{r}
+scc_hourly_common_2019_df <- 
+  readRDS(
+    paste0(data_path, "scc_hourly_common_2019_df.rds")
+  )
+
+scc_hourly_common_2020_df <- 
+  readRDS(
+    paste0(data_path, "scc_hourly_common_2020_df.rds")
+  )
+
+smeared_2019_df <- 
+  scc_hourly_common_2019_df %>% 
+  truncate_hourly_outliers() %>% 
+  add_utc_hour() %>% 
+  lag_median_dwell_to_utc_boundary() %>% 
+  filter(!(date %in% (dst_days %>% lubridate::ymd()) & hour <= 3)) %>% 
+  smear_hourly_visits() %>% 
+  apply_dwell_correction_factor()
+
+smeared_2020_df <- 
+  scc_hourly_common_2020_df %>% 
+  truncate_hourly_outliers() %>% 
+  add_utc_hour() %>% 
+  lag_median_dwell_to_utc_boundary() %>% 
+  filter(!(date %in% (dst_days %>% lubridate::ymd()) & hour <= 3)) %>% 
+  smear_hourly_visits() %>% 
+  apply_dwell_correction_factor()
+```
+
+
+## Compute fraction of maximum occupancy for each hour
+```{r}
+scc_preprocessed_2019_df <- 
+  smeared_2019_df %>% 
+  mutate(
+    max_occupancy = area_square_feet / MERCANTILE_OCCUPANCY_LOAD,
+    occupancy_ratio = avg_hourly_visits / max_occupancy
+  )
+
+scc_preprocessed_2020_df <- 
+  smeared_2020_df %>% 
+  mutate(
+    max_occupancy = area_square_feet / MERCANTILE_OCCUPANCY_LOAD,
+    occupancy_ratio = avg_hourly_visits / max_occupancy
+  )
+
+saveRDS(
+  scc_preprocessed_2019_df,
+  paste0(data_path, "scc_preprocessed_2019_df.rds")
+)
+
+saveRDS(
+  scc_preprocessed_2020_df,
+  paste0(data_path, "scc_preprocessed_2020_df.rds")
+)
+```
+
+
+# Academic and SCC capacity limit
+
+## Load baseline visit data
+```{r}
+scc_places_df <- 
+  readRDS(
+    paste0(data_path, "scc_places_df.rds")
+  )
+
+scc_places_hourly_open_imputed_df <- 
+  readRDS(
+    paste0(data_path, "scc_places_hourly_open_imputed_df.rds")
+  )
+
+scc_hourly_baseline_df <- 
+  load_hourly_scc_df(get_baseline_week_start_dates(), scc_places_df) %>% 
+  join_hourly_with_place_open(., scc_places_df, scc_places_hourly_open_imputed_df)
+```
+
+
+## Apply smear operation to baseline period
+```{r}
+smeared_baseline_df <- 
+  scc_hourly_baseline_df %>% 
+  truncate_hourly_outliers() %>% 
+  add_utc_hour() %>% 
+  lag_median_dwell_to_utc_boundary() %>% 
+  filter(!(date %in% (dst_days %>% lubridate::ymd()) & hour <= 3)) %>% 
+  smear_hourly_visits() %>% 
+  apply_dwell_correction_factor()
+
+saveRDS(
+  smeared_baseline_df,
+  paste0(data_path, "smeared_baseline_df.rds")
+)
+```
+
+
+## Compute academic and SCC capacity limit
+```{r}
+academic_capacity_limit_df <- 
+  smeared_baseline_df %>% 
+  filter(
+    date >= academic_baseline_start_date & date <= academic_baseline_end_date
+  ) %>% 
+  group_by(safegraph_place_id, type) %>% 
+  summarize(academic_max_occupancy = max(hourly_visits_smeared)) %>% 
+  mutate(academic_capacity_limit = 0.2 * academic_max_occupancy)
+
+scc_capacity_limit_df <- 
+  scc_places_df %>% 
+  mutate(
+      scc_max_occupancy = (gross_to_net_scale * area_square_feet) / MERCANTILE_OCCUPANCY_LOAD,
+      scc_capacity_limit = 0.2 * scc_max_occupancy
+  ) %>% 
+  select("safegraph_place_id", "scc_max_occupancy", "scc_capacity_limit", "type")
+
+scc_capacity_limit_df <- 
+  inner_join(
+    academic_capacity_limit_df, 
+    scc_capacity_limit_df,
+  ) 
+
+saveRDS(
+  scc_capacity_limit_df,
+  paste0(repo_path, output_data_dir, "scc_capacity_limit_df.rds")
+)
+```
+
+
+# Mobility-case growth correlation cleaning
+
+## Load case counts by county by month
+```{r}
+case_count_df <- 
+  read_csv(nytimes_case_path) %>%
+  mutate(
+    year=year(date),
+    month=month(date),
+    week=date %>% strftime("%V")
+  )
+```
+
+
+## Load Safegraph social distancing metrics
+```{r}
+social_distancing_20 <- readRDS(social_distancing_path_20)
+social_distancing_21 <- readRDS(social_distancing_path_21)
+
+social_distancing_df <- 
+  rbind(social_distancing_20, social_distancing_21) %>%
+  select(
+    origin_census_block_group,
+    date_range_start,
+    date_range_end,
+    device_count, 
+    distance_traveled_from_home,
+    median_non_home_dwell_time
+  ) 
+```
+
+
+## Cleaning and merging data
+```{r}
+# Map cbg to county and compute a weighted average of dwell time
+county_social_distancing_df <- 
+  social_distancing_df %>%
+  drop_na() %>%
+  mutate(
+    fips = substr(origin_census_block_group, 1, 5),
+    weighted_dwell_time = device_count * median_non_home_dwell_time,
+    weighted_distance = device_count * distance_traveled_from_home
+  ) %>% 
+  group_by(
+    fips,
+    date_range_start,
+    date_range_end
+  ) %>%
+  summarize(
+    cbgs = n_distinct(origin_census_block_group),
+    total_devices = sum(device_count),
+    weighted_average_dwell_time = sum(weighted_dwell_time) / total_devices,
+    weighted_average_distance = sum(weighted_distance) / total_devices
+  ) %>%
+  mutate(date = as.Date(date_range_start))
+
+## Combining data
+combined_data_df <- 
+  county_social_distancing_df %>%
+  left_join(case_count_df, by = c("date","fips")) 
+
+saveRDS(
+  combined_data_df,
+  paste0(repo_path, output_data_dir, "bay_area_case_distancing.rds")
+)
+```
+
+
+## Creating the baseline distance
+```{r}
+combined_data_df <- 
+  readRDS(
+    paste0(repo_path, output_data_dir, "bay_area_case_distancing.rds")
+  )
+
+baseline_df <- 
+  combined_data_df %>%
+  filter(date <= '2020-01-31' && date > '2020-01-07') %>%
+  mutate(wday = lubridate::wday(date)) %>% 
+  group_by(fips, wday) %>%
+  summarize(
+    baseline_dwell_time = mean(weighted_average_dwell_time),
+    baseline_distance = mean(weighted_average_distance)
+  )
+```
+
+
+```{r}
+#Putting it together
+analysis_data_df <- 
+  combined_data_df %>%
+  mutate(wday = lubridate::wday(date)) %>% 
+  filter(date > '2020-02-29' && date < '2021-03-01') %>%
+  left_join(baseline_df, by = c("fips", "wday")) %>%
+  mutate(
+    dwell_ratio = weighted_average_dwell_time / baseline_dwell_time,
+    distance_ratio = weighted_average_distance / baseline_distance  
+  ) %>% 
+  ungroup() %>% 
+  select(fips, date, county, cases, dwell_ratio, distance_ratio) %>% 
+  filter(!is.na(county))
+
+growth_data_df <- 
+  analysis_data_df %>% 
+  group_by(county) %>%
+  arrange(date, .by_group = TRUE) %>% 
+  nest() %>%
+  mutate(
+    roll_diff = map(
+      data,
+      ~ .x %>% mutate(
+          new_cases = slider::slide_dbl(
+            ., ~ .x$cases[2] - .x$cases[1], .before = 1),
+          mean_dwell_ratio_7 = slider::slide_dbl(
+            ., ~ mean(.x$dwell_ratio), .before = 3, .after= 3, .complete = TRUE)
+      )
+    )
+  ) %>% 
+  select(-data) %>% 
+  unnest(roll_diff) %>% 
+  group_by(county) %>% 
+  arrange(date, .by_group = TRUE) %>% 
+  nest() %>% 
+  mutate(
+    roll_sum = map(
+      data, 
+      ~ .x %>% mutate(
+        log_sum_3 = slider::slide_dbl(
+          ., ~ log(sum(.x$new_cases / 3)), .before = 2, .complete = TRUE),
+        log_sum_7 = slider::slide_dbl(
+          ., ~ log(sum(.x$new_cases / 7)), .before = 6, .complete = TRUE),
+        log_sum_14 = slider::slide_dbl(
+          ., ~ log(sum(.x$new_cases / 14)), .before = 13, .complete = TRUE),
+        mean_new_cases_7 = slider::slide_dbl(
+          ., ~ mean(.x$new_cases), .before = 6),
+      )
+    )
+  ) %>%
+  select(-data) %>% 
+  unnest(roll_sum) %>% 
+  mutate(
+    case_growth = log_sum_3 / (log_sum_7 + 1e-15),
+    case_growth_alt = log_sum_7 / (log_sum_14 + 1e-15)
+  )
+
+prior_ratio_df <- 
+  growth_data_df %>%
+  mutate(
+    dummy_date = date + 11,
+    mobility_dwell_ratio = dwell_ratio,
+  ) %>%
+  select(
+    dummy_date, 
+    mobility_dwell_ratio,
+    mean_dwell_ratio_7,
+    fips
+  ) %>%
+  rename(date = dummy_date)
+
+lagged_analysis_data_df <- 
+  growth_data_df %>%
+  select(
+    -c(
+      dwell_ratio,
+      distance_ratio, 
+      mean_dwell_ratio_7,
+    )
+  ) %>% 
+  left_join(prior_ratio_df, by = c("date","fips", "county")) %>%
+  drop_na() %>%
+  select(
+    county, 
+    new_cases, 
+    cases, 
+    mean_new_cases_7,
+    case_growth, 
+    case_growth_alt,
+    mobility_dwell_ratio,
+    mean_dwell_ratio_7,
+    date
+  ) %>%
+  mutate(month_yr = format(as.Date(date), "%Y-%m"))
+
+saveRDS(
+  lagged_analysis_data_df,
+  paste0(repo_path, output_data_dir, "lagged_analysis_data_df.rds")
+)
+```
+
+
+```{r}
+correlations_df <- 
+  lagged_analysis_data_df %>% 
+  group_by(county) %>%
+  arrange(date, .by_group = TRUE) %>% 
+  nest() %>%
+  mutate(
+    roll_cor = map(
+      data, 
+      ~ .x %>% mutate(
+        dwell_corr = slider::slide_dbl(
+          ., 
+          ~ cor.test(.x$case_growth, .x$mean_dwell_ratio_7, method = "pearson")[4]$estimate, 
+          .before = 27, 
+          .complete = TRUE),
+        dwell_lower_bound = slider::slide_dbl(
+          ., 
+          ~ cor.test(.x$case_growth, .x$mean_dwell_ratio_7, method = "pearson")$conf.int[1], 
+          .before = 27, 
+          .complete = TRUE),
+        dwell_upper_bound = slider::slide_dbl(
+          ., 
+          ~ cor.test(.x$case_growth, .x$mean_dwell_ratio_7, method = "pearson")$conf.int[2], 
+          .before = 27, 
+          .complete = TRUE),
+        dwell_corr_alt = slider::slide_dbl(
+          ., 
+          ~ cor.test(.x$case_growth_alt, .x$mean_dwell_ratio_7, method = "pearson")[4]$estimate, 
+          .before = 27, 
+          .complete = TRUE),
+        dwell_lower_bound_alt = slider::slide_dbl(
+          ., 
+          ~ cor.test(.x$case_growth_alt, .x$mean_dwell_ratio_7, method = "pearson")$conf.int[1], 
+          .before = 27, 
+          .complete = TRUE),
+        dwell_upper_bound_alt = slider::slide_dbl(
+          ., 
+          ~ cor.test(.x$case_growth_alt, .x$mean_dwell_ratio_7, method = "pearson")$conf.int[2], 
+          .before = 27, 
+          .complete = TRUE)
+      )
+    )
+  ) %>%
+  select(-data) %>% 
+  unnest(roll_cor)
+
+saveRDS(
+  correlations_df,
+  paste0(repo_path, output_data_dir, "correlations_df.rds")
+)
+```
+

@@ -1,0 +1,354 @@
+---
+title: "Capacity Paper Bay Area Patterns"
+author: "RegLab"
+date: "8/15/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(tigris)
+library(jsonlite)
+library(lubridate)
+library(ggplot2)
+```
+
+
+```{r}
+sg_path <- # Replace with path to directory with Safegraph and other data
+           # Files include: SafeGraph core POI for California, Bay Area census block groups (CBGs), 
+           # SafeGraph may-june-august 2020 square footage data, and SafeGraph raw CA weekly patterns and home panel summaries.
+
+bay_counties <- c(
+  "Alameda", 
+  "Contra Costa", 
+  "Marin", 
+  "Napa", 
+  "San Francisco", 
+  "San Mateo", 
+  "Santa Clara", 
+  "Solano", 
+  "Sonoma"
+)
+
+big_box_regex <- "Target|The Home Depot|Kmart|Walmart|Best Buy|Lowe's|IKEA"
+```
+
+
+```{r}
+ca_counties <- list_counties("CA")
+ca_pois <- readRDS(paste0(sg_path, "core_poi-ca.rds"))
+
+bay_cbgs <-
+  readRDS(paste0(sg_path, "bay_cbgs.rds"))%>% 
+  mutate(
+    county_code = substr(GEOID, 3, 5)
+  ) %>% 
+  left_join(ca_counties, by="county_code") %>% 
+  select(-county_code)
+
+sg_sqft <- readRDS(paste0(sg_path, "may-june-august-sqft.rds"))
+
+# Load normalization functions
+source("scripts/safegraph_normalization_functions.R", chdir=TRUE)
+```
+
+
+```{r}
+filter_sector_df <- function(sg_core_df) {
+  big_box_df <- 
+    sg_core_df %>% 
+    filter(
+      grepl(big_box_regex, location_name) 
+      | sub_category %in% c("All Other General Merchandise Stores")
+    ) %>% 
+    mutate(sector = "big_box")
+  
+  pharmacy_df <- 
+    sg_core_df %>% 
+    filter(
+      sub_category == "Pharmacies and Drug Stores"
+    ) %>% 
+    mutate(sector = "pharmacy")
+  
+  grocery_df <- 
+    sg_core_df %>% 
+    filter(
+      sub_category == "Supermarkets and Other Grocery (except Convenience) Stores"
+    ) %>% 
+    mutate(sector = "grocery")
+  
+  restaurant_df <- 
+    sg_core_df %>% 
+    filter(
+      sub_category == "Full-Service Restaurants" |
+      sub_category == "Limited-Service Restaurants"
+    ) %>% 
+    mutate(sector = "restaurant")
+  
+  sector_df <- 
+    big_box_df %>% 
+    rbind(pharmacy_df) %>% 
+    rbind(grocery_df) %>% 
+    rbind(restaurant_df)
+  
+  sector_df
+}
+
+sector_ca_pois <- filter_sector_df(ca_pois)
+
+ca_files <- 
+  list.files(paste0(sg_path,"weekly-patterns-ca"), full.names = T) %>% 
+  .[grepl("weekly-patterns-ca.rds",.)]
+
+ca_files[2:53]
+```
+
+
+```{r}
+for(file in ca_files){
+
+  print(file)
+  print(format(Sys.time(), "%a %b %d %X %Y"))
+  file_date <- substr(file,nchar(file)-32,nchar(file)-23)
+  
+  ca_patterns <- 
+    readRDS(file) %>% 
+    transmute(
+      safegraph_place_id,
+      date_range_start = date_range_start %>% substr(1,10) %>% as.Date(),
+      raw_visit_counts,
+      raw_visitor_counts,
+      visits_by_each_hour,
+      visitor_home_cbgs,
+      bucketed_dwell_times,
+      median_dwell,
+      county_code = poi_cbg %>% substr(3, 5),
+      poi_cbg
+    ) %>% 
+    left_join(
+      sg_sqft %>% 
+        select(safegraph_place_id, area_square_feet)
+    ) %>% 
+    left_join(
+      sector_ca_pois %>% 
+        select(safegraph_place_id, naics_code, sector)
+    ) %>% 
+    left_join(
+      ca_counties
+    ) %>%
+    select(-county_code)
+  
+  hps <-
+    readRDS(paste0(
+      sg_path,
+      'home-summary-ca/',
+      file_date,
+      '-home-panel-summary.rds'
+    ))
+  
+  for(curr_county in bay_counties){
+    county_cbgs <- bay_cbgs %>% 
+      filter(county == curr_county)
+    
+    county_patterns <- ca_patterns %>% 
+      filter(poi_cbg %in% county_cbgs$GEOID) %>% 
+      select(-poi_cbg)
+  
+    sg <- county_patterns %>%
+      select(
+        safegraph_place_id,
+        date_range_start,
+        raw_visit_counts,
+        raw_visitor_counts,
+        visits_by_each_hour,
+        visitor_home_cbgs
+      )
+  
+    sum <- suppressWarnings(normBG(sg, hps) %>%
+      select(
+        safegraph_place_id,
+        origin_census_block_group,
+        visit_counts,
+        ratio,
+        visits_by_each_hour,
+        date_range_start
+      ))
+    
+    county_patterns <- county_patterns %>%
+      filter(!is.na(sector)) %>% 
+      left_join(
+        sum %>%
+          group_by(safegraph_place_id) %>%
+          summarize(
+            visit_counts = sum(visit_counts, na.rm = T)
+          )
+      )
+    
+    saveRDS(county_patterns, paste0(
+      sg_path,
+      'weekly-patterns-bay/',
+      curr_county,
+      '/',
+      file_date,
+      '-weekly-patterns-bay.rds'
+    ))
+  
+  }
+}
+
+print(format(Sys.time(), "%a %b %d %X %Y"))
+```
+
+
+```{r}
+for(curr_county in bay_counties){ 
+
+  county_weekly_files <-
+    list.files(paste0(sg_path,"weekly-patterns-bay/", curr_county), full.names = T) %>%
+    .[grepl("weekly-patterns-bay.rds",.)]
+
+  for(file in county_weekly_files[1:49]){
+
+    print(file)
+    print(format(Sys.time(), "%a %b %d %X %Y"))
+    file_date <- substr(file,nchar(file)-33, nchar(file)-24)
+
+    weekly_temp <-
+      readRDS(file) %>%
+      mutate(
+        ratio = visit_counts/raw_visit_counts
+      )
+
+    hour_exploded <-
+      1:nrow(weekly_temp) %>%
+      map_dfr(function(i){
+
+        hourly_visits <-
+          substr(weekly_temp$visits_by_each_hour[i], 2, nchar(weekly_temp$visits_by_each_hour[i])-1) %>%
+          strsplit(',') %>%
+          .[[1]] %>%
+          as.numeric() %>%
+          as.data.frame() %>%
+          rename(hourly_visits = ".") %>%
+          mutate(
+            date = rep(weekly_temp$date_range_start[i]+0:6, each=24),
+            hour = rep(1:24, 7)
+          ) %>%
+          mutate(
+            hourly_visits = hourly_visits * weekly_temp$ratio[i],
+            sqft_per_visitor = weekly_temp$area_square_feet[i] / hourly_visits
+          ) %>%
+          mutate(
+            safegraph_place_id = weekly_temp$safegraph_place_id[i],
+            median_dwell = weekly_temp$median_dwell[i],
+            sector = weekly_temp$sector[i],
+            county = weekly_temp$county[i]
+          )
+      })
+
+    saveRDS(hour_exploded, paste0(
+      sg_path,
+      "hourly-patterns-bay/",
+      curr_county,
+      '/',
+      file_date,
+      "-hourly-patterns-bay.rds"
+    ))
+
+  }
+}
+
+print(format(Sys.time(), "%a %b %d %X %Y"))
+```
+
+
+```{r}
+for(curr_county in bay_counties){
+  
+  print(curr_county)
+  print(format(Sys.time(), "%a %b %d %X %Y"))
+  
+  hourly_files <- 
+    list.files(paste0(sg_path,"hourly-patterns-bay/", curr_county), full.names = T) %>% 
+    .[grepl("hourly-patterns-bay.rds",.)]
+
+  county_hourly <- 
+    hourly_files %>% 
+    map_dfr(readRDS) %>% 
+    mutate(
+      hourly_visits = ifelse(is.na(hourly_visits), 0, hourly_visits),
+      median_dwell = ifelse(is.na(median_dwell), 0, median_dwell)
+    )
+  
+  county_monthly <-
+    county_hourly %>%
+    mutate(
+      year = year(date),
+      month = month(date)
+    ) %>%
+    group_by(safegraph_place_id, year, month) %>%
+    summarize(monthly_visits = sum(hourly_visits))
+
+  county_in_scope_sg_ids <-
+    county_monthly %>%
+    filter(
+      year %in% c(2019, 2020)
+      & month %in% c(1, 12)
+    ) %>%
+    pivot_wider(
+      names_from=c(year, month),
+      values_from=monthly_visits,
+      names_prefix="visits_"
+    ) %>%
+    filter(
+      visits_2019_1 > 0
+      & visits_2019_12 > 0
+      & visits_2020_1 > 0
+      & visits_2020_12 > 0
+    ) %>%
+    .$safegraph_place_id
+  
+  county_daily <-
+    county_hourly %>% 
+    filter(
+      safegraph_place_id %in% county_in_scope_sg_ids
+    ) %>%
+    group_by(safegraph_place_id, county, date, sector) %>% 
+    summarize(
+      daily_visits = sum(hourly_visits),
+      peak_hourly_visits = max(hourly_visits),
+      median_dwell = unique(median_dwell)[1],
+    ) %>% ungroup()
+  
+  county_daily <-
+    county_daily %>% 
+    right_join(
+      merge(
+        county_daily %>% ungroup() %>% select(date) %>% unique(), 
+        county_daily %>% ungroup() %>% select(safegraph_place_id, county, sector) %>% unique()
+      ),
+      by = c("safegraph_place_id", "county", "sector", "date")
+    ) %>% 
+    mutate(
+      daily_visits = ifelse(is.na(daily_visits), 0, daily_visits),
+      peak_hourly_visits = ifelse(is.na(peak_hourly_visits), 0, peak_hourly_visits),
+      median_dwell = ifelse(is.na(median_dwell), 0, median_dwell)
+    )
+  
+  saveRDS(county_daily, paste0(
+    sg_path,
+    "daily-patterns-bay/",
+    curr_county,
+    "-daily-patterns"
+  ))
+}
+
+print(format(Sys.time(), "%a %b %d %X %Y"))
+```
+
