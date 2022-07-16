@@ -2,14 +2,14 @@
 
 ---
 
-This repo contains code to perform a difference-to-difference policy analysis of Bay Area capacity limits to accompany the paper "Science Translation During the COVID-19 Pandemic: An Academic-Public Health Partnership to Assess Capacity Limits in California"[https://ajph.aphapublications.org/doi/10.2105/AJPH.2021.306576]. 
+This repo contains code to perform a difference-to-difference policy analysis of Bay Area capacity limits to accompany the paper ["Science Translation During the COVID-19 Pandemic: An Academic-Public Health Partnership to Assess Capacity Limits in California"](https://ajph.aphapublications.org/doi/10.2105/AJPH.2021.306576). 
 
 ## Data
 
 This project relies on the following data:
 - SafeGraph Core Places (including metadata and square footage)
 - SafeGraph Weekly Patterns (including home panel summaries)
-- NYTimes COVID-19 Data [https://github.com/nytimes/covid-19-data]
+- [NYTimes COVID-19 Data](https://github.com/nytimes/covid-19-data)
 
 ## Pipeline
 
